@@ -84,6 +84,8 @@ function save(node) {
   const w = getWidget(node, "layout_json");
   if (w) w.value = JSON.stringify(node.k2);
   node.setDirtyCanvas(true, true);
+  // keep the full-layout JSON box in sync with edits made via the controls
+  if (node._jsonRefresh) { try { node._jsonRefresh(); } catch (e) { /* ignore */ } }
   // live preview: nudge any connected compose nodes to rebuild (debounced)
   try { pokeComposeConsumers(node); } catch (e) { /* ignore */ }
 }
@@ -94,6 +96,68 @@ function dropInvalidCells(node) {
   for (const ch of node.k2.characters) {
     ch.cells = (ch.cells || []).filter((c) => c >= 0 && c < max);
   }
+}
+
+// ---- full-layout JSON (aspect + grid + characters + links), for paste/sync ----
+// One object describing the WHOLE scene, so it can be copy-pasted (e.g. built by
+// Stansa.ai) and applied in one shot, and kept in sync with the editor controls.
+function fullLayout(node) {
+  const g = grid(node);
+  return {
+    aspect: String(widgetVal(node, "aspect", "rectangle 1216x832")),
+    grid_cols: g.cols,
+    grid_rows: g.rows,
+    batch_size: parseInt(widgetVal(node, "batch_size", 1)) || 1,
+    characters: (node.k2 && node.k2.characters) || [],
+    links: (node.k2 && node.k2.links) || [],
+  };
+}
+function fullLayoutJSON(node) { return JSON.stringify(fullLayout(node), null, 2); }
+
+// Apply a pasted/edited full-layout JSON back onto the node. BACKWARDS COMPATIBLE:
+// any field the JSON omits keeps its current value; malformed entries are dropped.
+// Accepts "interactions" as an alias for "links". Returns an error string on bad
+// JSON (so the editor can show it and keep the text), or null on success.
+function applyLayoutJSON(node, text) {
+  let data;
+  try { data = JSON.parse(text); } catch (e) { return "Invalid JSON: " + e.message; }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return "JSON must be an object";
+  const setW = (name, val) => { const w = getWidget(node, name); if (w && val !== undefined && val !== null) w.value = val; };
+  const clampInt = (v, lo, hi, cur) => { const n = parseInt(v); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : cur; };
+
+  // aspect: accept an exact dropdown option, else match on WxH, else keep current
+  if (typeof data.aspect === "string" && data.aspect) {
+    const aspW = getWidget(node, "aspect");
+    const opts = (aspW && aspW.options && aspW.options.values) || [];
+    let a = data.aspect;
+    if (opts.length && !opts.includes(a)) {
+      const m = a.match(/(\d+)\s*[x×]\s*(\d+)/);
+      if (m) { const hit = opts.find((o) => o.replace("×", "x").includes(m[1] + "x" + m[2])); if (hit) a = hit; }
+    }
+    if (!opts.length || opts.includes(a)) setW("aspect", a);
+  }
+  if (data.grid_cols !== undefined) setW("grid_cols", clampInt(data.grid_cols, 1, 8, grid(node).cols));
+  if (data.grid_rows !== undefined) setW("grid_rows", clampInt(data.grid_rows, 1, 8, grid(node).rows));
+  if (data.batch_size !== undefined) setW("batch_size", clampInt(data.batch_size, 1, 64, 1));
+
+  const normChars = (arr) => (Array.isArray(arr) ? arr : []).filter((c) => c && typeof c === "object").map((c) => ({
+    name: c.name || "", cells: Array.isArray(c.cells) ? c.cells.filter(Number.isInteger) : [], positive: c.positive || "", negative: c.negative || "",
+  }));
+  const normLinks = (arr) => (Array.isArray(arr) ? arr : []).filter((l) => l && typeof l === "object").map((l) => ({
+    between: Array.isArray(l.between) ? l.between.filter(Number.isInteger) : [], positive: l.positive || "", negative: l.negative || "",
+  }));
+  if (!node.k2) node.k2 = { characters: [], links: [] };
+  if (data.characters !== undefined) {
+    node.k2.characters = normChars(data.characters);
+    if (!node.k2.characters.length) node.k2.characters = [blankChar()];
+  }
+  const linksSrc = data.links !== undefined ? data.links : data.interactions;
+  if (linksSrc !== undefined) node.k2.links = normLinks(linksSrc);
+
+  dropInvalidCells(node);
+  save(node);
+  render(node);
+  return null;
 }
 
 function render(node) {
@@ -115,6 +179,50 @@ function render(node) {
     t.addEventListener("pointerdown", (e) => e.stopPropagation());
     return t;
   };
+
+  // ---- layout JSON (full scene: aspect + grid + characters + interactions) ----
+  // Kept in sync with the controls below (editing a card / grid rewrites this box);
+  // paste a full layout here and click Apply to load it in one shot. The Apply
+  // button is disabled while the box already matches the current layout.
+  root.appendChild(heading("Layout JSON (edit / paste → Apply)"));
+  node._syncedJSON = fullLayoutJSON(node);
+  const jsonTA = el("textarea", {
+    width: "100%", boxSizing: "border-box", background: "#161821", color: "#cfe3d6",
+    border: "1px solid #333", borderRadius: "5px", padding: "6px", fontSize: "11px",
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", resize: "vertical",
+    minHeight: "120px", marginBottom: "4px", whiteSpace: "pre",
+  }, { value: node._syncedJSON, spellcheck: false });
+  jsonTA.addEventListener("pointerdown", (e) => e.stopPropagation());
+  const jrow = el("div", { display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px" });
+  const applyBtn = button("Apply JSON layout", "#2e6f4e");
+  const jerr = el("span", { fontSize: "11px", color: "#c0616b", flex: "1", whiteSpace: "normal" }, { textContent: "" });
+  const refreshApplyState = () => {
+    const changed = jsonTA.value.trim() !== node._syncedJSON.trim();
+    applyBtn.disabled = !changed;
+    applyBtn.style.opacity = changed ? "1" : "0.5";
+    applyBtn.style.cursor = changed ? "pointer" : "default";
+    if (!changed) jerr.textContent = "";
+  };
+  // update the box when the controls below change (save() calls this)
+  node._jsonTA = jsonTA;
+  node._jsonRefresh = () => {
+    if (node._jsonTA !== jsonTA) return;           // ignore a stale closure after re-render
+    jsonTA.value = fullLayoutJSON(node);
+    node._syncedJSON = jsonTA.value;
+    refreshApplyState();
+  };
+  jsonTA.addEventListener("input", () => { jerr.textContent = ""; refreshApplyState(); });
+  applyBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+  applyBtn.addEventListener("click", () => {
+    if (applyBtn.disabled) return;
+    const err = applyLayoutJSON(node, jsonTA.value);   // success -> re-render (fresh box, synced)
+    if (err) jerr.textContent = err;                    // error -> keep text, show why
+  });
+  jrow.appendChild(applyBtn);
+  jrow.appendChild(jerr);
+  root.appendChild(jsonTA);
+  root.appendChild(jrow);
+  refreshApplyState();
 
   // ---- characters ----
   root.appendChild(heading("Characters"));
