@@ -948,11 +948,150 @@ class MultiCharPromptPreview:
         return {"ui": {"text": [text]}, "result": (text,)}
 
 
+def _list_llm_dirs():
+    """Discover local HF instruct-LLM directories (config.json + weights) under the
+    ComfyUI models dir, so the enhancer can offer them in a dropdown."""
+    import os
+    roots = []
+    try:
+        import folder_paths
+        m = folder_paths.models_dir
+        roots = [os.path.join(m, "LLM"), os.path.join(m, "LLM", "Qwen-VL"),
+                 os.path.join(m, "llm"), os.path.join(m, "prompt_generator")]
+    except Exception:
+        pass
+    found = {}
+    for r in roots:
+        if not os.path.isdir(r):
+            continue
+        for name in sorted(os.listdir(r)):
+            p = os.path.join(r, name)
+            if os.path.isdir(p) and os.path.exists(os.path.join(p, "config.json")):
+                found.setdefault(name, p)
+    return found
+
+
+class MultiCharLayoutEnhancer:
+    """OPTIONAL: enrich each character's (and interaction's) description in a layout
+    with a local uncensored instruct LLM, then pass the enriched layout to Multi-Char
+    Prompt Compose. Compose still does the STRUCTURE (count-lock, placement, interaction
+    binding); this only makes the per-character DESCRIPTIONS richer, so the structure is
+    preserved. `enable` off = passthrough, so it's safe to leave in a graph.
+
+    Loads the chosen model with transformers, frees ComfyUI's other models first so it
+    fits on the GPU, and frees itself before returning so the sampler has VRAM. On any
+    failure it passes the layout through unchanged (never breaks a run).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        models = _list_llm_dirs()
+        cls._MODELS = models
+        names = list(models.keys()) or ["(put an HF model in models/LLM/Qwen-VL)"]
+        return {
+            "required": {
+                "layout": ("REGIONAL_LAYOUT",),
+                "enable": ("BOOLEAN", {"default": False, "label_on": "enrich", "label_off": "bypass"}),
+                "model": (names,),
+                "enrich_characters": ("BOOLEAN", {"default": True}),
+                "enrich_interactions": ("BOOLEAN", {"default": True}),
+                "max_words": ("INT", {"default": 48, "min": 12, "max": 160}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            },
+        }
+
+    RETURN_TYPES = ("REGIONAL_LAYOUT", "STRING")
+    RETURN_NAMES = ("layout", "report")
+    FUNCTION = "enhance"
+    CATEGORY = "Regional/conditioning"
+    DESCRIPTION = (
+        "Enrich each character description in a layout with a local uncensored LLM, then "
+        "feed Multi-Char Prompt Compose (which keeps the structure). Off = passthrough. "
+        "Best on a strong text-encoder model (Chroma/Flux/SD3)."
+    )
+
+    def enhance(self, layout, enable, model, enrich_characters, enrich_interactions,
+                max_words, temperature, seed):
+        import copy, os
+        lay = copy.deepcopy(layout) if isinstance(layout, dict) else {"characters": [], "links": []}
+        if not enable:
+            return (lay, "layout enhancer: bypassed")
+        model_path = (getattr(self, "_MODELS", None) or _list_llm_dirs()).get(model)
+        if not model_path or not os.path.isdir(model_path):
+            return (lay, "layout enhancer: model not found (%s) - passthrough" % model)
+        try:
+            import torch, gc
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except Exception as e:
+            return (lay, "layout enhancer: transformers unavailable (%s) - passthrough" % e)
+
+        # free ComfyUI's cached models so the LLM fits on the GPU
+        try:
+            import comfy.model_management as mm
+            mm.unload_all_models()
+            mm.soft_empty_cache()
+        except Exception:
+            pass
+
+        SYS_C = ("You enrich ONE character's visual description for a black-and-white manga image prompt. "
+                 "Add concrete visual detail: clothing/outfit, hair, face and expression, body pose and where "
+                 "the arms, hands, and legs are. Keep it ONLY about this single character - do NOT mention other "
+                 "people, the room, or the background. Under %d words, comma-separated phrases. Output only the "
+                 "description, no preamble, no quotes." % int(max_words))
+        SYS_L = ("Enrich this physical interaction between characters for a manga image prompt. Describe the "
+                 "contact and their poses clearly. Under 28 words. Output only the description, no preamble.")
+        try:
+            tok = AutoTokenizer.from_pretrained(model_path)
+            mdl = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to("cuda")
+        except Exception as e:
+            return (lay, "layout enhancer: model load failed (%s) - passthrough" % e)
+        if seed:
+            try:
+                torch.manual_seed(int(seed))
+            except Exception:
+                pass
+
+        def gen(sysp, usr, maxn):
+            msgs = [{"role": "system", "content": sysp}, {"role": "user", "content": usr}]
+            t = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            i = tok(t, return_tensors="pt").to(mdl.device)
+            o = mdl.generate(**i, max_new_tokens=maxn, do_sample=temperature > 0,
+                             temperature=max(float(temperature), 0.01), top_p=0.9,
+                             repetition_penalty=1.05, pad_token_id=tok.eos_token_id)
+            return tok.decode(o[0][i.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("\n", " ")
+
+        rep = []
+        try:
+            if enrich_characters:
+                for c in lay.get("characters", []):
+                    if (c.get("positive") or "").strip():
+                        c["positive"] = gen(SYS_C, c["positive"], int(max_words) * 3)
+                        rep.append("- %s: %s" % (c.get("name", "?"), c["positive"]))
+            if enrich_interactions:
+                for l in lay.get("links", []):
+                    if (l.get("positive") or "").strip():
+                        l["positive"] = gen(SYS_L, l["positive"], 90)
+                        rep.append("- interaction: %s" % l["positive"])
+        finally:
+            try:
+                del mdl, tok
+            except Exception:
+                pass
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        return (lay, "\n".join(rep) if rep else "layout enhancer: nothing to enrich")
+
+
 NODE_CLASS_MAPPINGS = {
     "RegionalCharacterLayout": RegionalCharacterLayout,
     "RegionalMultiCharConditioning": RegionalMultiCharConditioning,
     "MultiCharPromptCompose": MultiCharPromptCompose,
     "MultiCharPromptPreview": MultiCharPromptPreview,
+    "MultiCharLayoutEnhancer": MultiCharLayoutEnhancer,
     "RegionalFaceDetailerSwitch": RegionalFaceDetailerSwitch,
     "RegionalHiresSwitch": RegionalHiresSwitch,
 }
@@ -961,6 +1100,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RegionalMultiCharConditioning": "Regional Multi-Char Conditioning",
     "MultiCharPromptCompose": "Multi-Char Prompt Compose (wording)",
     "MultiCharPromptPreview": "Multi-Char Prompt Preview (read-only)",
+    "MultiCharLayoutEnhancer": "Multi-Char Layout Enhancer (LLM, optional)",
     "RegionalFaceDetailerSwitch": "Regional FaceDetailer Toggle",
     "RegionalHiresSwitch": "Regional Hires Toggle",
 }
