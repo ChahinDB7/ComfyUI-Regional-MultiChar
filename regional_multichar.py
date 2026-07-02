@@ -436,17 +436,426 @@ class RegionalHiresSwitch:
         return (with_hires if enable_hires else base,)
 
 
+# ---------------------------------------------------------------------------
+# Wording-based multi-character composer (no masks) + a read-only prompt viewer.
+# The composer mirrors the RegionalCharacterLayout editor fields in plain text
+# with several optional structuring aids that help a strong text encoder
+# (Chroma / Flux / SD3) understand the scene. See
+# docs/MULTICHAR_PROMPT_COMPOSE_IMPROVEMENTS.md. With every aid off (count off,
+# names=off, bind off, roster off, order_group off, scale off, spatial=coarse,
+# format=prose, framing off, negatives=global_dedup) it reproduces the old flat
+# concatenation.
+# ---------------------------------------------------------------------------
+
+# vocab used to derive a stable "handle" from a character's free-text positive
+# when no explicit name is given (longer entries first so "old man" beats "man").
+_ROLE_WORDS = [
+    "old man", "old woman", "young man", "young woman", "boyfriend", "girlfriend",
+    "teenager", "gentleman", "princess", "prince", "warrior", "soldier", "student",
+    "mother", "father", "sister", "brother", "knight", "witch", "queen", "king",
+    "nurse", "maid", "woman", "man", "girl", "boy", "lady", "guy", "child", "kid",
+    "teen", "person", "figure", "mom", "dad", "elf",
+]
+_DESCRIPTOR_WORDS = [
+    "blonde", "blond", "brunette", "redhead", "red-haired", "dark-haired",
+    "black-haired", "silver-haired", "white-haired", "grey-haired", "gray-haired",
+    "pink-haired", "blue-haired", "long-haired", "short-haired", "young", "old",
+    "elderly", "tall", "short", "small", "large", "muscular", "athletic", "slim",
+    "elegant", "beautiful", "handsome", "cute", "sleeping", "smiling",
+]
+_ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh",
+             "eighth", "ninth", "tenth"]
+_NUM_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven",
+              "eight", "nine", "ten", "eleven", "twelve"]
+# per-character negative -> positive counter-trait (negative_mode=to_positive_assertion)
+_ANTONYMS = {
+    "old": "young", "old man": "young man", "old woman": "young woman",
+    "old face": "youthful face", "elderly": "youthful", "child": "adult",
+    "children": "adults", "ugly": "beautiful", "masculine woman": "feminine woman",
+    "feminine man": "masculine man", "fat": "slim", "awake": "asleep",
+    "standing": "seated", "large in frame": "small in the frame",
+    "close-up": "seen at a distance", "far apart": "close together",
+    "not touching": "touching", "facing away": "facing each other",
+}
+
+
+def _num_word(n):
+    return _NUM_WORDS[n] if 0 <= n < len(_NUM_WORDS) else str(n)
+
+
+def _cap(s):
+    return (s[0].upper() + s[1:]) if s else s
+
+
+def _join_and(items):
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return items[0] + " and " + items[1]
+    return ", ".join(items[:-1]) + ", and " + items[-1]
+
+
+def _match_vocab(text, vocab):
+    t = " " + " ".join((text or "").lower().replace(",", " ").replace(".", " ").split()) + " "
+    for w in vocab:
+        if " " + w + " " in t:
+            return w
+    return ""
+
+
+def _derive_handle(name, positive, index):
+    """A short, stable referent reused in the roster and interactions. Uses the
+    explicit name when set, else a distinctive noun phrase from the positive."""
+    name = (name or "").strip()
+    if name:
+        return ("the " + name.lower()) if name.lower() in _ROLE_WORDS else name
+    role = _match_vocab(positive, _ROLE_WORDS) or "person"
+    desc = _match_vocab(positive, _DESCRIPTOR_WORDS)
+    if role == "person" and not desc:
+        return "person " + str(index + 1)
+    return ("the " + desc + " " + role) if desc else ("the " + role)
+
+
+def _dedup_handles(handles):
+    """Make identical handles distinct ('the first blonde woman', ...)."""
+    counts = {}
+    for h in handles:
+        counts[h] = counts.get(h, 0) + 1
+    seen, out = {}, []
+    for h in handles:
+        if counts[h] > 1:
+            i = seen.get(h, 0)
+            seen[h] = i + 1
+            ordw = _ORDINALS[i] if i < len(_ORDINALS) else str(i + 1)
+            out.append(("the " + ordw + " " + h[4:]) if h.startswith("the ") else (h + " (" + ordw + ")"))
+        else:
+            out.append(h)
+    return out
+
+
+def _cell_fractions(cells, cols, rows):
+    cells = [c for c in cells if isinstance(c, int) and 0 <= c < cols * rows]
+    if not cells:
+        return None, None
+    cf = (sum(c % cols for c in cells) / len(cells)) / (cols - 1) if cols > 1 else 0.5
+    rf = (sum(c // cols for c in cells) / len(cells)) / (rows - 1) if rows > 1 else 0.5
+    return cf, rf
+
+
+def _loc_phrase(cf, rf, mode):
+    """Grid position -> location wording. coarse = left/center/right (+ fore/
+    background); fine/grid_coords = 2D area (upper-left, bottom center, ...)."""
+    if cf is None:
+        return ""
+    if mode == "coarse":
+        col = ("on the left side of the scene" if cf < 0.34
+               else "in the center of the scene" if cf <= 0.66
+               else "on the right side of the scene")
+        row = (" in the foreground" if rf > 0.66 else " in the far background" if rf < 0.34 else "")
+        return col + row
+    horiz = ("far left" if cf < 0.2 else "left" if cf < 0.4
+             else "center" if cf <= 0.6 else "right" if cf <= 0.8 else "far right")
+    vert = ("top" if rf < 0.2 else "upper" if rf < 0.4
+            else "" if rf <= 0.6 else "lower" if rf <= 0.8 else "bottom")
+    if not vert:
+        if horiz == "center":
+            return "in the center of the scene"
+        if horiz in ("left", "right"):
+            return "on the " + horiz + " side of the scene"
+        return "on the " + horiz + " of the scene"
+    return "in the " + (vert + " " + horiz).strip() + " area of the scene"
+
+
+def _scale_phrase(rf):
+    """Depth (row) -> size wording: top = small/distant, bottom = large/close."""
+    if rf is None:
+        return ""
+    if rf < 0.34:
+        return "small and distant, a small figure far away in the background"
+    if rf > 0.66:
+        return "large and prominent, close to the viewer in the foreground"
+    return ""
+
+
+def _excel_cells(cells, cols):
+    """Spreadsheet-style cell tags: column letters A,B,C..., row numbers 1,2,3..."""
+    out = []
+    for c in sorted(x for x in cells if isinstance(x, int) and x >= 0):
+        out.append(chr(65 + (c % cols)) + str(c // cols + 1))
+    return ", ".join(out)
+
+
+def _convert_negatives(neg_text):
+    """Split a per-character negative into (positive counter-traits, leftovers)."""
+    additions, leftovers = [], []
+    for term in [t.strip() for t in (neg_text or "").split(",") if t.strip()]:
+        if term.lower() in _ANTONYMS:
+            additions.append(_ANTONYMS[term.lower()])
+        else:
+            leftovers.append(term)
+    return additions, leftovers
+
+
+def _dedup_terms(chunks):
+    terms, seen = [], set()
+    for chunk in chunks:
+        for t in (chunk or "").split(","):
+            t = t.strip()
+            if t and t.lower() not in seen:
+                seen.add(t.lower())
+                terms.append(t)
+    return terms
+
+
+def _action_needs_subject(text):
+    """True if the interaction text is a bare action fragment ('kissing ...') that
+    should get '{who} are ...' prepended; False if it already reads as a full
+    clause with its own subject ('the woman and the man are kissing ...')."""
+    words = (text or "").strip().lower().split()
+    first = words[0] if words else ""
+    return first not in ("the", "a", "an", "they", "he", "she", "both", "two", "three")
+
+
+def _report_md(s, gpos, chars, cols, interactions, neg_terms, pos_text, neg_text):
+    """Human-readable markdown of everything the composer decided."""
+    L = ["# Multi-Char Prompt — Assembled Breakdown", ""]
+    L.append("## Settings")
+    L.append("- format: **%s** · spatial: **%s** · grid: **%dx%d**"
+             % (s["format"], s["spatial"], s["grid"][0], s["grid"][1]))
+    L.append("- count lock: **%s** · names: **%s** · roster: **%s** · order+group: **%s**"
+             % (s["count"], s["names"], s["roster"], s["order_group"]))
+    L.append("- scale hints: **%s** · bind interactions: **%s** · auto framing: **%s** · negatives: **%s**"
+             % (s["scale"], s["bind"], s["framing"], s["neg_mode"]))
+    L += ["", "## Global positive", "> " + (gpos if gpos else "*(empty)*"), ""]
+    L.append("## Characters (%d)" % len(chars))
+    for c in chars:
+        cells = ", ".join(str(x) for x in sorted(c["cells"])) or "none"
+        grid = _excel_cells(c["cells"], cols) or "—"
+        bits = ["cells [%s]" % cells, "grid %s" % grid, "loc: %s" % (c["loc"] or "*(whole image)*")]
+        if c["scale"]:
+            bits.append("scale: " + c["scale"])
+        if c["pos_add"]:
+            bits.append("neg→pos: " + ", ".join(c["pos_add"]))
+        L.append("- **%s** (label: %s) — %s" % (c["handle"], c["label"], " · ".join(bits)))
+    L += ["", "## Interactions (%d)" % len(interactions)]
+    if interactions:
+        for refs, sent in interactions:
+            L.append("- between #%s → %s" % (",".join(str(r) for r in refs) or "?", sent))
+    else:
+        L.append("- *(none)*")
+    L += ["", "## Negative terms (%d)" % len(neg_terms),
+          "> " + (", ".join(neg_terms) if neg_terms else "*(empty)*"), ""]
+    L += ["## FINAL POSITIVE", "```", pos_text if pos_text else "(empty)", "```", ""]
+    L += ["## FINAL NEGATIVE", "```", neg_text if neg_text else "(empty)", "```"]
+    return "\n".join(L)
+
+
+def assemble_multichar(cols, rows, raw_chars, links, opts):
+    """Pure text assembly shared by the compose node and the /multichar/preview
+    route (single source of truth — no encoding). Returns {positive, negative, report}."""
+    global_positive = opts.get("global_positive", "") or ""
+    global_negative = opts.get("global_negative", "") or ""
+    subject_count_lock = bool(opts.get("subject_count_lock", True))
+    use_names = opts.get("use_names", "handle")
+    bind_interactions = bool(opts.get("bind_interactions", True))
+    cast_roster = bool(opts.get("cast_roster", True))
+    order_and_group = bool(opts.get("order_and_group", True))
+    auto_scale_hints = bool(opts.get("auto_scale_hints", True))
+    spatial_detail = opts.get("spatial_detail", "fine")
+    output_format = opts.get("output_format", "prose")
+    auto_framing = bool(opts.get("auto_framing", False))
+    negative_mode = opts.get("negative_mode", "global_dedup")
+    cols = int(cols or 3)
+    rows = int(rows or 1)
+    raw_chars = raw_chars or []
+    links = links or []
+
+    # keep only characters that actually describe someone; remember their 1-based
+    # position so interaction links (which reference it) still resolve.
+    chars = []
+    for i, c in enumerate(raw_chars):
+        p = (c.get("positive") or "").strip()
+        if not p:
+            continue
+        chars.append({
+            "ref": i + 1,
+            "name": (c.get("name") or "").strip(),
+            "positive": p,
+            "negative": (c.get("negative") or "").strip(),
+            "cells": [x for x in (c.get("cells") or []) if isinstance(x, int)],
+            "pos_add": [],
+        })
+
+    # stable, de-duplicated handles (used in roster + interactions)
+    handles = _dedup_handles([_derive_handle(c["name"], c["positive"], k)
+                              for k, c in enumerate(chars)])
+    for c, h in zip(chars, handles):
+        c["handle"] = h
+        c["label"] = c["name"] if c["name"] else (_cap(h[4:]) if h.startswith("the ") else _cap(h))
+
+    # placement (location phrase, scale hint, excel coords)
+    for c in chars:
+        cf, rf = _cell_fractions(c["cells"], cols, rows)
+        c["cf"], c["rf"] = cf, rf
+        c["loc"] = _loc_phrase(cf, rf, spatial_detail)
+        c["scale"] = _scale_phrase(rf) if auto_scale_hints else ""
+        c["coords"] = _excel_cells(c["cells"], cols) if spatial_detail == "grid_coords" else ""
+
+    byref = {c["ref"]: c for c in chars}
+
+    # ---- negatives (pre-pass: to_positive_assertion feeds the positive) ----
+    neg_chunks = [global_negative.strip()] if global_negative.strip() else []
+    for c in chars:
+        if not c["negative"]:
+            continue
+        if negative_mode == "to_positive_assertion":
+            adds, leftover = _convert_negatives(c["negative"])
+            c["pos_add"].extend(adds)
+            if leftover:
+                neg_chunks.append(", ".join(leftover))
+        else:
+            neg_chunks.append(c["negative"])
+    for ln in links:
+        n = (ln.get("negative") or "").strip()
+        if n:
+            neg_chunks.append(n)
+    neg_terms = _dedup_terms(neg_chunks)
+    neg_text = ", ".join(neg_terms)
+
+    # ---- positive ----
+    def desc_of(c):
+        extra = list(c["pos_add"])
+        if c["scale"]:
+            extra.append(c["scale"])
+        if c["coords"]:
+            extra.append("located around grid " + c["coords"])
+        return (c["positive"] + ", " + ", ".join(extra)) if extra else c["positive"]
+
+    pos_parts = []
+    if global_positive.strip():
+        pos_parts.append(global_positive.strip())
+
+    if auto_framing and chars:
+        cfs = [c["cf"] for c in chars if c["cf"] is not None]
+        if len(cfs) >= 2 and (max(cfs) - min(cfs)) > 0.5:
+            pos_parts.append("This is a wide establishing shot that shows the whole scene.")
+        elif len(chars) == 1:
+            pos_parts.append("This is a medium close-up shot.")
+        else:
+            pos_parts.append("This is a medium shot.")
+
+    if subject_count_lock and chars:
+        n = len(chars)
+        pos_parts.append("There is exactly one person in the scene and no one else."
+                         if n == 1 else
+                         "There are exactly " + _num_word(n) + " people in the scene and no one else.")
+
+    if cast_roster and chars:
+        pos_parts.append("Cast: " + "; ".join(c["handle"] for c in chars) + ".")
+
+    # order + group characters by shared cells (co-located = one clause)
+    if order_and_group:
+        groups, order = {}, []
+        for c in chars:
+            sig = tuple(sorted(c["cells"]))
+            if sig not in groups:
+                groups[sig] = []
+                order.append(sig)
+            groups[sig].append(c)
+
+        def gkey(sig):
+            g = groups[sig]
+            cfs = [x["cf"] for x in g if x["cf"] is not None]
+            rfs = [x["rf"] for x in g if x["rf"] is not None]
+            return (min(cfs) if cfs else 0.5, min(rfs) if rfs else 0.5)
+
+        order.sort(key=gkey)
+        grouped = [groups[sig] for sig in order]
+    else:
+        grouped = [[c] for c in chars]
+
+    num = 0
+    for group in grouped:
+        loc = group[0]["loc"]
+        loc_cap = _cap(loc)
+        rendered = []
+        for c in group:
+            num += 1
+            subj = "" if use_names == "off" else (c["label"] if use_names == "label" else c["handle"])
+            rendered.append((num, subj, desc_of(c)))
+
+        if output_format == "numbered":
+            for n_, subj, d in rendered:
+                if subj:
+                    body = (subj + " (" + loc + "): " + d + ".") if loc else (subj + ": " + d + ".")
+                else:
+                    body = ("(" + loc + ") " + d + ".") if loc else (d + ".")
+                pos_parts.append(str(n_) + ") " + body)
+        elif output_format == "labeled":
+            if loc_cap and len(rendered) > 1:
+                inner = "; ".join((subj + ": " + d) if subj else d for _, subj, d in rendered)
+                pos_parts.append(loc_cap + ": " + inner + ".")
+            else:
+                for _, subj, d in rendered:
+                    if subj:
+                        pos_parts.append((subj + " (" + loc + "): " + d + ".") if loc else (subj + ": " + d + "."))
+                    else:
+                        pos_parts.append((loc_cap + ", " + d + ".") if loc_cap else (d + "."))
+        else:  # prose
+            if len(rendered) > 1 and loc_cap:
+                inner = "; and ".join((subj + " — " + d) if subj else d for _, subj, d in rendered)
+                pos_parts.append(loc_cap + ", " + inner + ".")
+            else:
+                for _, subj, d in rendered:
+                    if subj:
+                        pos_parts.append((loc_cap + ", " + subj + " — " + d + ".") if loc_cap
+                                         else (_cap(subj) + " — " + d + "."))
+                    else:
+                        pos_parts.append((loc_cap + ", " + d + ".") if loc_cap else (d + "."))
+
+    # interactions (bound to the named characters, or verbatim)
+    interactions_report = []
+    for ln in links:
+        p = (ln.get("positive") or "").strip()
+        if not p:
+            continue
+        refs = [b for b in (ln.get("between") or []) if isinstance(b, int)]
+        members = [byref[b] for b in refs if b in byref]
+        if bind_interactions and members and _action_needs_subject(p):
+            subj = _join_and([m["handle"] for m in members])
+            verb = "is" if len(members) == 1 else "are"
+            sent = _cap(subj) + " " + verb + " " + p + "."
+        else:
+            sent = p + "."
+        pos_parts.append(sent)
+        interactions_report.append((refs, sent))
+
+    pos_text = " ".join(pos_parts)
+    report = _report_md(
+        {"format": output_format, "spatial": spatial_detail, "scale": auto_scale_hints,
+         "count": subject_count_lock, "names": use_names, "roster": cast_roster,
+         "order_group": order_and_group, "bind": bind_interactions,
+         "framing": auto_framing, "neg_mode": negative_mode, "grid": (cols, rows)},
+        global_positive.strip(), chars, cols, interactions_report, neg_terms, pos_text, neg_text)
+    return {"positive": pos_text, "negative": neg_text, "report": report}
+
+
 class MultiCharPromptCompose:
     """Structured multi-character PROMPT composer - the breakdown editor WITHOUT masks.
 
-    Reuses the same RegionalCharacterLayout editor (per-character cards + interaction
-    links + a grid for rough placement), but instead of masking it converts each
-    character's grid position into LOCATION WORDING ("on the left side", "on the right
-    side", ...) and assembles ONE natural-language positive + negative. Feed it to a
-    strong text-encoder model (Chroma / Flux / SD3) which follows positional wording.
+    Reuses the RegionalCharacterLayout editor (per-character cards + interaction
+    links + a grid) and assembles ONE natural-language positive + negative that a
+    strong text encoder (Chroma / Flux / SD3) can follow. Optional structuring
+    aids help the model understand who is present, where, and doing what:
+    count lock, stable handles, bound interactions, cast roster, ordered/grouped
+    placement, scale hints, finer spatial wording, output format, auto framing,
+    and negative handling. With all aids off it reproduces the old flat output.
 
-    Outputs CONDITIONING (positive, negative) ready for a KSampler, plus the assembled
-    text (so you can see/copy exactly what was built). No latent, no masks.
+    Outputs CONDITIONING (positive, negative), the assembled positive/negative
+    text, and a markdown prompt_report for the Multi-Char Prompt Preview node.
     """
 
     @classmethod
@@ -454,70 +863,96 @@ class MultiCharPromptCompose:
         return {
             "required": {
                 "clip": ("CLIP",),
-                "global_positive": ("STRING", {"multiline": True, "default": ""}),
-                "global_negative": ("STRING", {"multiline": True, "default": ""}),
+                "global_positive": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Scene-wide style + environment applied to the whole image (art style, setting, lighting)."}),
+                "global_negative": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Things to avoid everywhere. On Chroma/Flux the negative is global (no per-region binding)."}),
+                "subject_count_lock": ("BOOLEAN", {"default": True, "label_on": "state the count", "label_off": "no count",
+                    "tooltip": "ON: adds 'There are exactly N people and no one else' to stop dropped/extra characters. OFF: model may add background people."}),
+                "use_names": (["handle", "label", "off"], {"default": "handle",
+                    "tooltip": "How each character is named. handle: natural referent ('the blonde woman') reused everywhere (best coherence). label: 'Woman: ...' prefix (most readable). off: no subject prefix (old behavior; fine for one character)."}),
+                "bind_interactions": ("BOOLEAN", {"default": True, "label_on": "bind to characters", "label_off": "verbatim",
+                    "tooltip": "ON: rewrites an interaction to name its two characters ('The woman and the man are kissing...') from the between chips — type only the action. OFF: uses the interaction text verbatim."}),
+                "cast_roster": ("BOOLEAN", {"default": True, "label_on": "list the cast", "label_off": "no roster",
+                    "tooltip": "ON: adds a 'Cast: ...' line up front so the model registers distinct people before the detailed sentences (reduces merging). Turn off for 1-2 simple characters."}),
+                "order_and_group": ("BOOLEAN", {"default": True, "label_on": "order + group", "label_off": "card order",
+                    "tooltip": "ON: sorts characters left->right and merges same-cell characters into one clause. OFF: card order, each separate. Keep ON for multi-character scenes."}),
+                "auto_scale_hints": ("BOOLEAN", {"default": True, "label_on": "add scale words", "label_off": "no scale",
+                    "tooltip": "ON: adds size words from grid depth (top row = small/distant, bottom row = large/close). Needs a grid with rows>1. Fixes a background character rendering too big."}),
+                "spatial_detail": (["fine", "coarse", "grid_coords"], {"default": "fine",
+                    "tooltip": "Grid cell -> words. fine: left/center/right + upper/lower areas. coarse: just left/center/right (+ fore/background). grid_coords: fine wording PLUS spreadsheet tags (A1,B2) — experimental extra cue."}),
+                "output_format": (["prose", "labeled", "numbered"], {"default": "prose",
+                    "tooltip": "Sentence style. prose: flowing sentences (best for the model). labeled: 'Name (location): ...' (readable). numbered: '1) ...' (most explicit)."}),
+                "auto_framing": ("BOOLEAN", {"default": False, "label_on": "derive shot", "label_off": "off",
+                    "tooltip": "ON: derives a shot from character spread (wide establishing shot when spread out, else medium shot). Turn OFF if you set the shot yourself in global_positive."}),
+                "negative_mode": (["global_dedup", "to_positive_assertion"], {"default": "global_dedup",
+                    "tooltip": "Per-character negatives. global_dedup: merge + de-duplicate all negatives. to_positive_assertion: convert a character negative into a positive counter-trait ('old'->'young') on that character (often obeyed better)."}),
             },
             "optional": {"layout": ("REGIONAL_LAYOUT",)},
         }
 
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "STRING", "STRING")
-    RETURN_NAMES = ("positive", "negative", "positive_text", "negative_text")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("positive", "negative", "positive_text", "negative_text", "prompt_report")
     FUNCTION = "compose"
     CATEGORY = "Regional/conditioning"
     DESCRIPTION = (
-        "Multi-character breakdown by WORDING (not masks). Takes the character/interaction "
-        "layout from Regional Characters, turns each character's grid spot into a location "
-        "phrase, and assembles one positive + negative prompt encoded for a KSampler. Best "
-        "on text-encoder-strong models (Chroma/Flux/SD3)."
+        "Multi-character breakdown by WORDING (not masks). Mirrors the character/"
+        "interaction layout in one natural-language prompt with optional structuring "
+        "aids (count lock, stable handles, bound interactions, cast roster, ordered/"
+        "grouped placement, scale hints, finer spatial wording, output format, auto "
+        "framing, negative handling). Best on Chroma/Flux/SD3. Also emits a markdown "
+        "prompt_report for the Preview node."
     )
 
-    def _location(self, cells, cols, rows):
-        cells = [c for c in cells if isinstance(c, int) and 0 <= c < cols * rows]
-        if not cells:
-            return ""
-        cf = (sum(c % cols for c in cells) / len(cells)) / (cols - 1) if cols > 1 else 0.5
-        rf = (sum(c // cols for c in cells) / len(cells)) / (rows - 1) if rows > 1 else 0.5
-        col = ("on the left side of the scene" if cf < 0.34
-               else "in the center of the scene" if cf <= 0.66
-               else "on the right side of the scene")
-        row = (" in the foreground" if rf > 0.66 else " in the far background" if rf < 0.34 else "")
-        return col + row
-
-    def compose(self, clip, global_positive, global_negative, layout=None):
+    def compose(self, clip, global_positive, global_negative, subject_count_lock,
+                use_names, bind_interactions, cast_roster, order_and_group,
+                auto_scale_hints, spatial_detail, output_format, auto_framing,
+                negative_mode, layout=None):
         cols = int(layout.get("grid_cols", 3) or 3) if layout else 3
         rows = int(layout.get("grid_rows", 1) or 1) if layout else 1
-        chars = (layout.get("characters") if layout else []) or []
+        raw_chars = (layout.get("characters") if layout else []) or []
         links = (layout.get("links") if layout else []) or []
+        r = assemble_multichar(cols, rows, raw_chars, links, {
+            "global_positive": global_positive, "global_negative": global_negative,
+            "subject_count_lock": subject_count_lock, "use_names": use_names,
+            "bind_interactions": bind_interactions, "cast_roster": cast_roster,
+            "order_and_group": order_and_group, "auto_scale_hints": auto_scale_hints,
+            "spatial_detail": spatial_detail, "output_format": output_format,
+            "auto_framing": auto_framing, "negative_mode": negative_mode})
+        pos = clip.encode_from_tokens_scheduled(clip.tokenize(r["positive"]))
+        neg = clip.encode_from_tokens_scheduled(clip.tokenize(r["negative"]))
+        return (pos, neg, r["positive"], r["negative"], r["report"])
 
-        pos_parts = [global_positive.strip()] if global_positive.strip() else []
-        neg_parts = [global_negative.strip()] if global_negative.strip() else []
-        for c in chars:
-            p = (c.get("positive") or "").strip()
-            if p:
-                loc = self._location(c.get("cells", []), cols, rows)
-                pos_parts.append(f"{loc.capitalize()}, {p}." if loc else p + ".")
-            n = (c.get("negative") or "").strip()
-            if n:
-                neg_parts.append(n)
-        for ln in links:
-            p = (ln.get("positive") or "").strip()
-            if p:
-                pos_parts.append(p + ".")
-            n = (ln.get("negative") or "").strip()
-            if n:
-                neg_parts.append(n)
 
-        pos_text = " ".join(pos_parts)
-        neg_text = ", ".join(neg_parts)
-        pos = clip.encode_from_tokens_scheduled(clip.tokenize(pos_text))
-        neg = clip.encode_from_tokens_scheduled(clip.tokenize(neg_text))
-        return (pos, neg, pos_text, neg_text)
+class MultiCharPromptPreview:
+    """Read-only viewer. Renders the assembled prompt / prompt_report (or any
+    STRING) as markdown inside the node so you can see exactly what was built.
+    Wire the Multi-Char Prompt Compose 'prompt_report' output into 'text'."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"text": ("STRING", {"forceInput": True})}}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "show"
+    OUTPUT_NODE = True
+    CATEGORY = "Regional/conditioning"
+    DESCRIPTION = (
+        "Read-only markdown viewer for the assembled multi-character prompt. Wire "
+        "'prompt_report' (or any STRING) in; it renders inside the node for debugging."
+    )
+
+    def show(self, text):
+        text = text if isinstance(text, str) else ("" if text is None else str(text))
+        return {"ui": {"text": [text]}, "result": (text,)}
 
 
 NODE_CLASS_MAPPINGS = {
     "RegionalCharacterLayout": RegionalCharacterLayout,
     "RegionalMultiCharConditioning": RegionalMultiCharConditioning,
     "MultiCharPromptCompose": MultiCharPromptCompose,
+    "MultiCharPromptPreview": MultiCharPromptPreview,
     "RegionalFaceDetailerSwitch": RegionalFaceDetailerSwitch,
     "RegionalHiresSwitch": RegionalHiresSwitch,
 }
@@ -525,6 +960,38 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RegionalCharacterLayout": "Regional Characters (grid layout)",
     "RegionalMultiCharConditioning": "Regional Multi-Char Conditioning",
     "MultiCharPromptCompose": "Multi-Char Prompt Compose (wording)",
+    "MultiCharPromptPreview": "Multi-Char Prompt Preview (read-only)",
     "RegionalFaceDetailerSwitch": "Regional FaceDetailer Toggle",
     "RegionalHiresSwitch": "Regional Hires Toggle",
 }
+
+
+# ---------------------------------------------------------------------------
+# Live-preview route: the editor POSTs the layout + settings and gets the
+# assembled positive/negative/report back from the SAME assembler used for
+# generation (single source of truth -> the preview never disagrees with what
+# is rendered). Pure string work, no model, so it is instant. Registered only
+# if the ComfyUI server is importable (it always is at custom-node load time).
+# ---------------------------------------------------------------------------
+try:
+    from server import PromptServer
+    from aiohttp import web
+
+    @PromptServer.instance.routes.post("/multichar/preview")
+    async def _multichar_preview(request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        layout = data.get("layout") or {}
+        opts = data.get("opts") or {}
+        try:
+            result = assemble_multichar(
+                layout.get("grid_cols", 3), layout.get("grid_rows", 1),
+                layout.get("characters") or [], layout.get("links") or [], opts)
+            return web.json_response(result)
+        except Exception as e:  # never 500 the editor; show the error inline
+            return web.json_response(
+                {"positive": "", "negative": "", "report": "**preview error:** " + str(e)})
+except Exception:
+    pass
