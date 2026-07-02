@@ -997,6 +997,7 @@ class MultiCharLayoutEnhancer:
                 "enrich_interactions": ("BOOLEAN", {"default": True}),
                 "max_words": ("INT", {"default": 30, "min": 12, "max": 160}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
             },
         }
@@ -1012,7 +1013,7 @@ class MultiCharLayoutEnhancer:
     )
 
     def enhance(self, layout, enable, model, enrich_characters, enrich_interactions,
-                max_words, temperature, seed):
+                max_words, temperature, top_p, seed):
         import copy, os
         lay = copy.deepcopy(layout) if isinstance(layout, dict) else {"characters": [], "links": []}
         if not enable:
@@ -1059,7 +1060,8 @@ class MultiCharLayoutEnhancer:
             t = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             i = tok(t, return_tensors="pt").to(mdl.device)
             o = mdl.generate(**i, max_new_tokens=maxn, do_sample=temperature > 0,
-                             temperature=max(float(temperature), 0.01), top_p=0.9,
+                             temperature=max(float(temperature), 0.01),
+                             top_p=min(max(float(top_p), 0.01), 1.0),
                              repetition_penalty=1.05, pad_token_id=tok.eos_token_id)
             return tok.decode(o[0][i.input_ids.shape[1]:], skip_special_tokens=True).strip().replace("\n", " ")
 
