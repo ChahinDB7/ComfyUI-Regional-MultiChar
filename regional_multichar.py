@@ -995,7 +995,7 @@ class MultiCharLayoutEnhancer:
                 "model": (names,),
                 "enrich_characters": ("BOOLEAN", {"default": True}),
                 "enrich_interactions": ("BOOLEAN", {"default": True}),
-                "max_words": ("INT", {"default": 48, "min": 12, "max": 160}),
+                "max_words": ("INT", {"default": 30, "min": 12, "max": 160}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.5, "step": 0.05}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
             },
@@ -1034,13 +1034,15 @@ class MultiCharLayoutEnhancer:
         except Exception:
             pass
 
-        SYS_C = ("You enrich ONE character's visual description for a black-and-white manga image prompt. "
-                 "Add concrete visual detail: clothing/outfit, hair, face and expression, body pose and where "
-                 "the arms, hands, and legs are. Keep it ONLY about this single character - do NOT mention other "
-                 "people, the room, or the background. Under %d words, comma-separated phrases. Output only the "
-                 "description, no preamble, no quotes." % int(max_words))
-        SYS_L = ("Enrich this physical interaction between characters for a manga image prompt. Describe the "
-                 "contact and their poses clearly. Under 28 words. Output only the description, no preamble.")
+        SYS_C = ("You rewrite ONE character's description for a black-and-white MANGA image (grayscale, no color). "
+                 "Rules: keep it SHORT (max %d words); make this character clearly DISTINCT from anyone else "
+                 "(unique hair, build, age, outfit); give face/expression, outfit, and a clear full-body pose "
+                 "stating where the arms, hands, and legs are; NEVER use color words (it is grayscale - use tone "
+                 "words like pale, dark, light, or omit color); do NOT mention other people, the room, or the "
+                 "background. Output only the description as comma-separated phrases, no preamble, no quotes." % int(max_words))
+        SYS_L = ("Rewrite this interaction between characters for a manga image. Describe the physical contact and "
+                 "both poses concretely (grips, hands, bodies - e.g. holding a bottle by its neck tilted directly "
+                 "above a glass with a stream pouring in). Max 24 words. No color words. Output only the description.")
         try:
             tok = AutoTokenizer.from_pretrained(model_path)
             mdl = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to("cuda")
