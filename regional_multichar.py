@@ -996,6 +996,7 @@ class MultiCharLayoutEnhancer:
                 "enrich_characters": ("BOOLEAN", {"default": True}),
                 "enrich_interactions": ("BOOLEAN", {"default": True}),
                 "max_words": ("INT", {"default": 50, "min": 12, "max": 160}),
+                "smart_wording": ("BOOLEAN", {"default": True, "label_on": "smart (adaptive length)", "label_off": "fixed (always short)"}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.5, "step": 0.05}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
@@ -1013,7 +1014,7 @@ class MultiCharLayoutEnhancer:
     )
 
     def enhance(self, layout, enable, model, enrich_characters, enrich_interactions,
-                max_words, temperature, top_p, seed):
+                max_words, smart_wording, temperature, top_p, seed):
         import copy, os
         lay = copy.deepcopy(layout) if isinstance(layout, dict) else {"characters": [], "links": []}
         if not enable:
@@ -1035,17 +1036,30 @@ class MultiCharLayoutEnhancer:
         except Exception:
             pass
 
-        SYS_C = ("You rewrite ONE character's description for a black-and-white MANGA image (grayscale, no color). "
-                 "Rules: use only as many words as this character genuinely needs - be concise (a simple character "
-                 "may need just 10-15 words, an elaborate one more), and NEVER exceed %d words; make this character "
-                 "clearly DISTINCT from anyone else (unique hair, build, age, outfit); give face/expression, outfit, "
-                 "and a clear full-body pose stating where the arms, hands, and legs are; NEVER use color words (it is "
-                 "grayscale - use tone words like pale, dark, light, or omit color); do NOT mention other people, the "
-                 "room, or the background. Output only the description as comma-separated phrases, no preamble, no quotes." % int(max_words))
-        SYS_L = ("Rewrite this interaction between characters for a manga image. Describe the physical contact and "
-                 "both poses concretely (grips, hands, bodies - e.g. holding a bottle by its neck tilted directly "
-                 "above a glass with a stream pouring in). Use only as many words as needed, never more than 28. "
-                 "No color words. Output only the description.")
+        if smart_wording:
+            # adaptive: max_words is a soft UPPER bound - use only as many as needed
+            SYS_C = ("You rewrite ONE character's description for a black-and-white MANGA image (grayscale, no color). "
+                     "Rules: use only as many words as this character genuinely needs - be concise (a simple character "
+                     "may need just 10-15 words, an elaborate one more), and NEVER exceed %d words; make this character "
+                     "clearly DISTINCT from anyone else (unique hair, build, age, outfit); give face/expression, outfit, "
+                     "and a clear full-body pose stating where the arms, hands, and legs are; NEVER use color words (it is "
+                     "grayscale - use tone words like pale, dark, light, or omit color); do NOT mention other people, the "
+                     "room, or the background. Output only the description as comma-separated phrases, no preamble, no quotes." % int(max_words))
+            SYS_L = ("Rewrite this interaction between characters for a manga image. Describe the physical contact and "
+                     "both poses concretely (grips, hands, bodies - e.g. holding a bottle by its neck tilted directly "
+                     "above a glass with a stream pouring in). Use only as many words as needed, never more than 28. "
+                     "No color words. Output only the description.")
+        else:
+            # fixed: always terse, aim for the cap (the original behaviour)
+            SYS_C = ("You rewrite ONE character's description for a black-and-white MANGA image (grayscale, no color). "
+                     "Rules: keep it SHORT (max %d words); make this character clearly DISTINCT from anyone else "
+                     "(unique hair, build, age, outfit); give face/expression, outfit, and a clear full-body pose "
+                     "stating where the arms, hands, and legs are; NEVER use color words (it is grayscale - use tone "
+                     "words like pale, dark, light, or omit color); do NOT mention other people, the room, or the "
+                     "background. Output only the description as comma-separated phrases, no preamble, no quotes." % int(max_words))
+            SYS_L = ("Rewrite this interaction between characters for a manga image. Describe the physical contact and "
+                     "both poses concretely (grips, hands, bodies - e.g. holding a bottle by its neck tilted directly "
+                     "above a glass with a stream pouring in). Max 24 words. No color words. Output only the description.")
         try:
             tok = AutoTokenizer.from_pretrained(model_path)
             mdl = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to("cuda")
