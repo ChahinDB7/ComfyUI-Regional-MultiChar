@@ -185,7 +185,9 @@ class RegionalCharacterLayout:
     ASPECTS = {
         "wide 1536x832": (1536, 832),
         "rectangle 1216x832": (1216, 832),
+        "landscape 1216x1024": (1216, 1024),
         "square 1024x1024": (1024, 1024),
+        "portrait 1024x1216": (1024, 1216),
         "portrait 832x1216": (832, 1216),
         "tall 832x1536": (832, 1536),
     }
