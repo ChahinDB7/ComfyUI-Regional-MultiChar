@@ -14,6 +14,7 @@ What it adds over plain regional masking:
   identical ones that fight. Grid cells are a suggestion, not a hard box.
 """
 import json
+import re
 
 import torch
 import torch.nn.functional as F
@@ -460,7 +461,7 @@ _DESCRIPTOR_WORDS = [
     "blonde", "blond", "brunette", "redhead", "red-haired", "dark-haired",
     "black-haired", "silver-haired", "white-haired", "grey-haired", "gray-haired",
     "pink-haired", "blue-haired", "long-haired", "short-haired", "young", "old",
-    "elderly", "tall", "short", "small", "large", "muscular", "athletic", "slim",
+    "elderly", "mature", "adult", "middle-aged", "tall", "short", "small", "large", "muscular", "athletic", "slim",
     "elegant", "beautiful", "handsome", "cute", "sleeping", "smiling",
 ]
 _ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh",
@@ -506,11 +507,24 @@ def _match_vocab(text, vocab):
     return ""
 
 
-def _derive_handle(name, positive, index):
+def _derive_handle(name, positive, index, *, role_descriptions=False):
     """A short, stable referent reused in the roster and interactions. Uses the
     explicit name when set, else a distinctive noun phrase from the positive."""
     name = (name or "").strip()
     if name:
+        if role_descriptions:
+            words = name.lower().split()
+            roles = set(_ROLE_WORDS)
+            descriptors = set(_DESCRIPTOR_WORDS)
+            if (len(words) <= 4 and any(name.lower().endswith(role) for role in roles)
+                    and (all(w in descriptors or w in roles or w in {"the", "a", "an"}
+                             for w in words))):
+                phrase = name.lower()
+                for article in ("the ", "a ", "an "):
+                    if phrase.startswith(article):
+                        phrase = phrase[len(article):]
+                        break
+                return "the " + phrase
         return ("the " + name.lower()) if name.lower() in _ROLE_WORDS else name
     role = _match_vocab(positive, _ROLE_WORDS) or "person"
     desc = _match_vocab(positive, _DESCRIPTOR_WORDS)
@@ -619,7 +633,8 @@ def _action_needs_subject(text):
     return first not in ("the", "a", "an", "they", "he", "she", "both", "two", "three")
 
 
-def _report_md(s, gpos, chars, cols, interactions, neg_terms, pos_text, neg_text):
+def _report_md(s, gpos, chars, cols, interactions, neg_terms, pos_text, neg_text,
+               *, audit=None, adjustments=None, dropped_negatives=None, warnings=None):
     """Human-readable markdown of everything the composer decided."""
     L = ["# Multi-Char Prompt — Assembled Breakdown", ""]
     L.append("## Settings")
@@ -629,12 +644,16 @@ def _report_md(s, gpos, chars, cols, interactions, neg_terms, pos_text, neg_text
              % (s["count"], s["names"], s["roster"], s["order_group"]))
     L.append("- scale hints: **%s** · bind interactions: **%s** · auto framing: **%s** · negatives: **%s**"
              % (s["scale"], s["bind"], s["framing"], s["neg_mode"]))
+    L.append("- profile: **%s** · negative cap: **%s** · cap priority: **%s** · spatial cues: **%s** · scale cues: **%s**"
+             % (s["profile"], s["cap"] or "unlimited", s["cap_priority"],
+                s["spatial_cues"], s["scale_cues"]))
     L += ["", "## Global positive", "> " + (gpos if gpos else "*(empty)*"), ""]
     L.append("## Characters (%d)" % len(chars))
     for c in chars:
         cells = ", ".join(str(x) for x in sorted(c["cells"])) or "none"
         grid = _excel_cells(c["cells"], cols) or "—"
-        bits = ["cells [%s]" % cells, "grid %s" % grid, "loc: %s" % (c["loc"] or "*(whole image)*")]
+        loc = c["loc"] or ("*(not emitted)*" if c.get("loc_skipped") and c["cells"] else "*(whole image)*")
+        bits = ["cells [%s]" % cells, "grid %s" % grid, "loc: %s" % loc]
         if c["scale"]:
             bits.append("scale: " + c["scale"])
         if c["pos_add"]:
@@ -648,12 +667,85 @@ def _report_md(s, gpos, chars, cols, interactions, neg_terms, pos_text, neg_text
         L.append("- *(none)*")
     L += ["", "## Negative terms (%d)" % len(neg_terms),
           "> " + (", ".join(neg_terms) if neg_terms else "*(empty)*"), ""]
-    L += ["## FINAL POSITIVE", "```", pos_text if pos_text else "(empty)", "```", ""]
-    L += ["## FINAL NEGATIVE", "```", neg_text if neg_text else "(empty)", "```"]
+    L += ["## Duplication audit"]
+    if audit:
+        for clause, blocks in audit:
+            L.append("- `%s` in %s" % (clause, ", ".join(blocks)))
+    else:
+        L.append("- *(no exact repeated clauses across blocks)*")
+    L += ["", "## Profile adjustments"]
+    L.extend("- " + item for item in (adjustments or ["None."]))
+    if dropped_negatives:
+        L.append("- Dropped negative terms: " + ", ".join(dropped_negatives))
+    L += ["", "## Length stats"]
+    for name, value in (("Positive", pos_text), ("Negative", neg_text)):
+        words = len(value.split())
+        estimate = max(0, (len(value) + 3) // 4)
+        L.append("- %s: %d words, about %d tokens (character estimate)." % (name, words, estimate))
+    L.append("- Token counts are rough; the active text encoder may split text differently.")
+    L.extend("- Warning: " + item for item in (warnings or []))
+    L.append("")
+    L += ["## FINAL POSITIVE", "```", pos_text, "```", ""]
+    L += ["## FINAL NEGATIVE", "```", neg_text, "```"]
     return "\n".join(L)
 
 
-def assemble_multichar(cols, rows, raw_chars, links, opts):
+def _clause_key(text):
+    return " ".join(text.strip().rstrip(".!? ").lower().split())
+
+
+def _clauses(text):
+    return [part.strip() for part in re.split(r"[,;\n]+", text or "") if part.strip()]
+
+
+def _duplication_audit(global_positive, global_negative, chars, links):
+    blocks = [("positive", "global positive", global_positive),
+              ("negative", "global negative", global_negative)]
+    blocks += [("positive", "character #%d positive" % c["ref"], c["positive"])
+               for c in chars]
+    blocks += [("negative", "character #%d negative" % c["ref"], c["negative"])
+               for c in chars]
+    blocks += [("positive", "interaction #%d positive" % i, (ln.get("positive") or ""))
+               for i, ln in enumerate(links, 1)]
+    blocks += [("negative", "interaction #%d negative" % i, (ln.get("negative") or ""))
+               for i, ln in enumerate(links, 1)]
+    seen = {}
+    for polarity, label, value in blocks:
+        for clause in _clauses(value):
+            key = _clause_key(clause)
+            if key:
+                entry = seen.setdefault((polarity, key), (clause, []))
+                if label not in entry[1]:
+                    entry[1].append(label)
+    return [(clause, labels) for clause, labels in seen.values() if len(labels) > 1]
+
+
+def _explicit_count(text):
+    values = {word: i for i, word in enumerate(_NUM_WORDS)}
+    word = r"(\d+|" + "|".join(_NUM_WORDS) + r")"
+    patterns = [r"\b(?:exactly|only)\s+" + word + r"\s+(?:people|persons|person|characters|subjects)\b",
+                r"\btotal\s+headcount\s*(?:is|:|of)?\s*" + word + r"\b"]
+    matches = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text or "", re.IGNORECASE):
+            count = match.group(1).lower()
+            matches.append(int(count) if count.isdigit() else values[count])
+    return matches
+
+
+def _flux_sentence(text):
+    text = (text or "").strip()
+    if not text:
+        return text
+    text = re.sub(r"([.!?])\.+$", r"\1", text)
+    text = re.sub(r"(?<=[.!?])\s+([a-z])", lambda m: " " + m.group(1).upper(), text)
+    text = _cap(text)
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def assemble_multichar(cols, rows, raw_chars, links, opts, *, prompt_profile="default",
+                       negative_term_cap=0, spatial_cues="auto", scale_cues="off",
+                       negative_cap_priority="global_first"):
     """Pure text assembly shared by the compose node and the /multichar/preview
     route (single source of truth — no encoding). Returns {positive, negative, report}."""
     global_positive = opts.get("global_positive", "") or ""
@@ -672,6 +764,8 @@ def assemble_multichar(cols, rows, raw_chars, links, opts):
     rows = int(rows or 1)
     raw_chars = raw_chars or []
     links = links or []
+    flux2 = prompt_profile == "flux2"
+    adjustments, warnings = [], []
 
     # keep only characters that actually describe someone; remember their 1-based
     # position so interaction links (which reference it) still resolve.
@@ -690,24 +784,38 @@ def assemble_multichar(cols, rows, raw_chars, links, opts):
         })
 
     # stable, de-duplicated handles (used in roster + interactions)
-    handles = _dedup_handles([_derive_handle(c["name"], c["positive"], k)
+    handles = _dedup_handles([_derive_handle(c["name"], c["positive"], k,
+                                               role_descriptions=flux2)
                               for k, c in enumerate(chars)])
     for c, h in zip(chars, handles):
         c["handle"] = h
         c["label"] = c["name"] if c["name"] else (_cap(h[4:]) if h.startswith("the ") else _cap(h))
 
     # placement (location phrase, scale hint, excel coords)
+    same_cells = len(chars) > 1 and len({tuple(sorted(c["cells"])) for c in chars}) == 1
+    skip_spatial = flux2 and (spatial_cues == "off" or
+                              (spatial_cues == "auto" and (cols * rows == 1 or same_cells)))
+    skip_scale = flux2 and scale_cues != "row_based"
+    if skip_spatial:
+        adjustments.append("Skipped grid location cues: no useful relative position in this layout."
+                           if spatial_cues == "auto" else "Skipped grid location cues by setting.")
+    if skip_scale and auto_scale_hints:
+        adjustments.append("Skipped row-based scale cues; grid height alone does not establish depth.")
     for c in chars:
         cf, rf = _cell_fractions(c["cells"], cols, rows)
         c["cf"], c["rf"] = cf, rf
-        c["loc"] = _loc_phrase(cf, rf, spatial_detail)
-        c["scale"] = _scale_phrase(rf) if auto_scale_hints else ""
-        c["coords"] = _excel_cells(c["cells"], cols) if spatial_detail == "grid_coords" else ""
+        c["loc_skipped"] = skip_spatial
+        c["loc"] = "" if skip_spatial else _loc_phrase(cf, rf, spatial_detail)
+        c["scale"] = _scale_phrase(rf) if auto_scale_hints and not skip_scale else ""
+        c["coords"] = (_excel_cells(c["cells"], cols)
+                       if spatial_detail == "grid_coords" and not skip_spatial else "")
 
     byref = {c["ref"]: c for c in chars}
 
     # ---- negatives (pre-pass: to_positive_assertion feeds the positive) ----
-    neg_chunks = [global_negative.strip()] if global_negative.strip() else []
+    global_neg = [global_negative.strip()] if global_negative.strip() else []
+    char_neg = []
+    link_neg = []
     for c in chars:
         if not c["negative"]:
             continue
@@ -715,14 +823,22 @@ def assemble_multichar(cols, rows, raw_chars, links, opts):
             adds, leftover = _convert_negatives(c["negative"])
             c["pos_add"].extend(adds)
             if leftover:
-                neg_chunks.append(", ".join(leftover))
+                char_neg.append(", ".join(leftover))
         else:
-            neg_chunks.append(c["negative"])
+            char_neg.append(c["negative"])
     for ln in links:
         n = (ln.get("negative") or "").strip()
         if n:
-            neg_chunks.append(n)
+            link_neg.append(n)
+    cap = max(0, int(negative_term_cap or 0))
+    neg_chunks = (link_neg + global_neg + char_neg if flux2 and cap and negative_cap_priority == "interaction_first"
+                  else global_neg + char_neg + link_neg)
     neg_terms = _dedup_terms(neg_chunks)
+    dropped_negatives = []
+    if cap and len(neg_terms) > cap:
+        dropped_negatives = neg_terms[cap:]
+        neg_terms = neg_terms[:cap]
+        adjustments.append("Capped negatives at %d terms; dropped %d." % (cap, len(dropped_negatives)))
     neg_text = ", ".join(neg_terms)
 
     # ---- positive ----
@@ -747,7 +863,13 @@ def assemble_multichar(cols, rows, raw_chars, links, opts):
         else:
             pos_parts.append("This is a medium shot.")
 
-    if subject_count_lock and chars:
+    counts = _explicit_count(global_positive) if flux2 else []
+    skip_count = flux2 and bool(chars) and len(chars) in counts
+    if skip_count and subject_count_lock:
+        adjustments.append("Skipped count lock: global positive already states %d people." % len(chars))
+    if counts and any(count != len(chars) for count in counts):
+        warnings.append("Global positive has a count that conflicts with the %d described characters." % len(chars))
+    if subject_count_lock and chars and not skip_count:
         n = len(chars)
         pos_parts.append("There is exactly one person in the scene and no one else."
                          if n == 1 else
@@ -778,13 +900,19 @@ def assemble_multichar(cols, rows, raw_chars, links, opts):
         grouped = [[c] for c in chars]
 
     num = 0
-    for group in grouped:
+    group_end_positions = []
+    group_by_ref = {}
+    for group_index, group in enumerate(grouped):
+        for c in group:
+            group_by_ref[c["ref"]] = group_index
         loc = group[0]["loc"]
         loc_cap = _cap(loc)
         rendered = []
         for c in group:
             num += 1
             subj = "" if use_names == "off" else (c["label"] if use_names == "label" else c["handle"])
+            if flux2 and output_format in ("labeled", "numbered") and c["name"] and use_names == "handle":
+                subj = c["label"]
             rendered.append((num, subj, desc_of(c)))
 
         if output_format == "numbered":
@@ -815,32 +943,93 @@ def assemble_multichar(cols, rows, raw_chars, links, opts):
                                          else (_cap(subj) + " — " + d + "."))
                     else:
                         pos_parts.append((loc_cap + ", " + d + ".") if loc_cap else (d + "."))
+        group_end_positions.append(len(pos_parts))
 
     # interactions (bound to the named characters, or verbatim)
     interactions_report = []
+    insert_after = {}
+    deduped_clauses = 0
     for ln in links:
         p = (ln.get("positive") or "").strip()
         if not p:
             continue
         refs = [b for b in (ln.get("between") or []) if isinstance(b, int)]
         members = [byref[b] for b in refs if b in byref]
+        if flux2 and members:
+            member_clauses = {_clause_key(clause) for m in members for clause in _clauses(m["positive"])}
+            clauses = _clauses(p)
+            kept = [clause for clause in clauses if _clause_key(clause) not in member_clauses]
+            if not kept:
+                deduped_clauses += len(clauses)
+                interactions_report.append((refs, "(omitted: all clauses repeat member descriptions)"))
+                continue
+            if kept[0] != clauses[0] and not (_action_needs_subject(kept[0]) and
+                                              kept[0].split()[0].lower().endswith("ing")):
+                kept.insert(0, clauses[0])
+            deduped_clauses += len(clauses) - len(kept)
+            p = ", ".join(kept)
         if bind_interactions and members and _action_needs_subject(p):
             subj = _join_and([m["handle"] for m in members])
             verb = "is" if len(members) == 1 else "are"
             sent = _cap(subj) + " " + verb + " " + p + "."
         else:
             sent = p + "."
-        pos_parts.append(sent)
+        if flux2 and members:
+            last_group = max(group_by_ref[m["ref"]] for m in members)
+            insert_after.setdefault(last_group, []).append(sent)
+        else:
+            pos_parts.append(sent)
         interactions_report.append((refs, sent))
 
+    if flux2 and insert_after:
+        reordered, previous = [], 0
+        for group_index, end in enumerate(group_end_positions):
+            reordered.extend(pos_parts[previous:end])
+            reordered.extend(insert_after.get(group_index, []))
+            previous = end
+        reordered.extend(pos_parts[previous:])
+        pos_parts = reordered
+    if flux2:
+        pos_parts = [_flux_sentence(part) for part in pos_parts]
+        if deduped_clauses:
+            adjustments.append("Removed %d exact interaction clauses already in member descriptions." % deduped_clauses)
+    if cap and dropped_negatives and not flux2:
+        adjustments.append("Negative cap applies to the default profile because it was set explicitly.")
     pos_text = " ".join(pos_parts)
+    audit = _duplication_audit(global_positive, global_negative, chars, links)
+    if max((len(pos_text) + 3) // 4, (len(neg_text) + 3) // 4) > 450:
+        warnings.append("Approximate length exceeds 450 tokens; check the active encoder context limit.")
     report = _report_md(
         {"format": output_format, "spatial": spatial_detail, "scale": auto_scale_hints,
          "count": subject_count_lock, "names": use_names, "roster": cast_roster,
          "order_group": order_and_group, "bind": bind_interactions,
-         "framing": auto_framing, "neg_mode": negative_mode, "grid": (cols, rows)},
-        global_positive.strip(), chars, cols, interactions_report, neg_terms, pos_text, neg_text)
+         "framing": auto_framing, "neg_mode": negative_mode, "grid": (cols, rows),
+         "profile": prompt_profile, "cap": cap, "cap_priority": negative_cap_priority,
+         "spatial_cues": spatial_cues, "scale_cues": scale_cues},
+        global_positive.strip(), chars, cols, interactions_report, neg_terms, pos_text, neg_text,
+        audit=audit, adjustments=adjustments, dropped_negatives=dropped_negatives, warnings=warnings)
     return {"positive": pos_text, "negative": neg_text, "report": report}
+
+
+def _compose_layout(layout, layout_json_override):
+    if not layout_json_override or not layout_json_override.strip():
+        return layout or {}
+    try:
+        parsed = json.loads(layout_json_override)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid Layout JSON override: %s" % exc) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Layout JSON override must be an object")
+    chars = parsed.get("characters", (layout or {}).get("characters", []))
+    links = parsed.get("links", parsed.get("interactions", (layout or {}).get("links", [])))
+    if not isinstance(chars, list) or not isinstance(links, list):
+        raise ValueError("Layout JSON characters and links must be arrays")
+    return {
+        "grid_cols": max(1, min(8, int(parsed.get("grid_cols", (layout or {}).get("grid_cols", 3))))),
+        "grid_rows": max(1, min(8, int(parsed.get("grid_rows", (layout or {}).get("grid_rows", 1))))),
+        "characters": chars,
+        "links": links,
+    }
 
 
 class MultiCharPromptCompose:
@@ -888,7 +1077,21 @@ class MultiCharPromptCompose:
                 "negative_mode": (["global_dedup", "to_positive_assertion"], {"default": "global_dedup",
                     "tooltip": "Per-character negatives. global_dedup: merge + de-duplicate all negatives. to_positive_assertion: convert a character negative into a positive counter-trait ('old'->'young') on that character (often obeyed better)."}),
             },
-            "optional": {"layout": ("REGIONAL_LAYOUT",)},
+            "optional": {
+                "layout": ("REGIONAL_LAYOUT",),
+                "prompt_profile": (["default", "flux2"], {"default": "default",
+                    "tooltip": "default keeps the existing prompt assembly. flux2 trims redundant cues and places interactions near their characters."}),
+                "negative_term_cap": ("INT", {"default": 0, "min": 0, "max": 1000,
+                    "tooltip": "0 keeps all deduplicated negative terms. A positive value caps them in the selected priority order."}),
+                "negative_cap_priority": (["global_first", "interaction_first"], {"default": "global_first",
+                    "tooltip": "When a cap is set, keep global negatives first or keep interaction guards first. interaction_first works in flux2 mode."}),
+                "spatial_cues": (["auto", "always", "off"], {"default": "auto",
+                    "tooltip": "flux2 only: auto skips grid wording when it carries no relative position; always forces it; off suppresses it."}),
+                "scale_cues": (["off", "row_based"], {"default": "off",
+                    "tooltip": "flux2 only: row_based infers apparent depth from row position; off avoids that assumption."}),
+                "layout_json_override": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Optional pasted layout. When set, it replaces the connected layout for this composer only."}),
+            },
         }
 
     RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "STRING", "STRING", "STRING")
@@ -907,7 +1110,10 @@ class MultiCharPromptCompose:
     def compose(self, clip, global_positive, global_negative, subject_count_lock,
                 use_names, bind_interactions, cast_roster, order_and_group,
                 auto_scale_hints, spatial_detail, output_format, auto_framing,
-                negative_mode, layout=None):
+                negative_mode, layout=None, *, prompt_profile="default", negative_term_cap=0,
+                negative_cap_priority="global_first", spatial_cues="auto", scale_cues="off",
+                layout_json_override=""):
+        layout = _compose_layout(layout, layout_json_override)
         cols = int(layout.get("grid_cols", 3) or 3) if layout else 3
         rows = int(layout.get("grid_rows", 1) or 1) if layout else 1
         raw_chars = (layout.get("characters") if layout else []) or []
@@ -918,20 +1124,48 @@ class MultiCharPromptCompose:
             "bind_interactions": bind_interactions, "cast_roster": cast_roster,
             "order_and_group": order_and_group, "auto_scale_hints": auto_scale_hints,
             "spatial_detail": spatial_detail, "output_format": output_format,
-            "auto_framing": auto_framing, "negative_mode": negative_mode})
+            "auto_framing": auto_framing, "negative_mode": negative_mode},
+            prompt_profile=prompt_profile, negative_term_cap=negative_term_cap,
+            negative_cap_priority=negative_cap_priority, spatial_cues=spatial_cues,
+            scale_cues=scale_cues)
         pos = clip.encode_from_tokens_scheduled(clip.tokenize(r["positive"]))
         neg = clip.encode_from_tokens_scheduled(clip.tokenize(r["negative"]))
         return (pos, neg, r["positive"], r["negative"], r["report"])
 
 
+def _prompts_from_report(text):
+    marker = "## FINAL POSITIVE\n```\n"
+    divider = "\n```\n\n## FINAL NEGATIVE\n```\n"
+    start = text.rfind(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    middle = text.find(divider, start)
+    if middle < 0:
+        return None
+    neg_start = middle + len(divider)
+    end = text.rfind("\n```")
+    if end < neg_start:
+        return None
+    return text[start:middle], text[neg_start:end]
+
+
 class MultiCharPromptPreview:
-    """Read-only viewer. Renders the assembled prompt / prompt_report (or any
-    STRING) as markdown inside the node so you can see exactly what was built.
-    Wire the Multi-Char Prompt Compose 'prompt_report' output into 'text'."""
+    """Show the exact positive and negative prompt text from a compose report.
+
+    Direct text inputs can override report parsing. The text output passes through
+    the original input so existing graph links keep working.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"text": ("STRING", {"forceInput": True})}}
+        return {
+            "required": {"text": ("STRING", {"forceInput": True})},
+            "optional": {
+                "positive_text": ("STRING", {"forceInput": True}),
+                "negative_text": ("STRING", {"forceInput": True}),
+            },
+        }
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("text",)
@@ -939,13 +1173,28 @@ class MultiCharPromptPreview:
     OUTPUT_NODE = True
     CATEGORY = "Regional/conditioning"
     DESCRIPTION = (
-        "Read-only markdown viewer for the assembled multi-character prompt. Wire "
-        "'prompt_report' (or any STRING) in; it renders inside the node for debugging."
+        "Shows the raw positive and negative text in separate copyable blocks. "
+        "Wire prompt_report to text; optional positive_text and negative_text inputs "
+        "take the exact composer outputs directly."
     )
 
-    def show(self, text):
+    def show(self, text, positive_text=None, negative_text=None):
         text = text if isinstance(text, str) else ("" if text is None else str(text))
-        return {"ui": {"text": [text]}, "result": (text,)}
+        parsed = _prompts_from_report(text)
+        if positive_text is None and parsed is not None:
+            positive_text = parsed[0]
+        if negative_text is None and parsed is not None:
+            negative_text = parsed[1]
+        has_prompts = positive_text is not None or negative_text is not None
+        positive_text = positive_text if isinstance(positive_text, str) else (
+            "" if positive_text is None else str(positive_text))
+        negative_text = negative_text if isinstance(negative_text, str) else (
+            "" if negative_text is None else str(negative_text))
+        return {
+            "ui": {"text": [text], "positive_text": [positive_text],
+                   "negative_text": [negative_text], "has_prompts": [has_prompts]},
+            "result": (text,),
+        }
 
 
 def _list_llm_dirs():
@@ -1146,9 +1395,15 @@ try:
         layout = data.get("layout") or {}
         opts = data.get("opts") or {}
         try:
+            layout = _compose_layout(layout, opts.get("layout_json_override", ""))
             result = assemble_multichar(
                 layout.get("grid_cols", 3), layout.get("grid_rows", 1),
-                layout.get("characters") or [], layout.get("links") or [], opts)
+                layout.get("characters") or [], layout.get("links") or [], opts,
+                prompt_profile=opts.get("prompt_profile", "default"),
+                negative_term_cap=opts.get("negative_term_cap", 0),
+                negative_cap_priority=opts.get("negative_cap_priority", "global_first"),
+                spatial_cues=opts.get("spatial_cues", "auto"),
+                scale_cues=opts.get("scale_cues", "off"))
             return web.json_response(result)
         except Exception as e:  # never 500 the editor; show the error inline
             return web.json_response(

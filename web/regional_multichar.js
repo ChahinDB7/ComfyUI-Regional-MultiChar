@@ -395,11 +395,28 @@ app.registerExtension({
 });
 
 // ---------------------------------------------------------------------------
-// Read-only markdown viewer for the MultiCharPromptPreview node. Wire the
-// compose node's "prompt_report" (or any STRING) in to see the assembled prompt.
-// Nothing here is load-bearing for generation - only for debugging comfort.
+// The preview keeps the old report input and shows its final prompt strings.
+// Direct prompt inputs also work when a prompt contains markdown fences.
 // ---------------------------------------------------------------------------
 const PREVIEW_NODE = "MultiCharPromptPreview";
+
+function previewValue(value) {
+  const item = Array.isArray(value) ? value[0] : value;
+  return item === undefined || item === null ? "" : String(item);
+}
+
+async function copyPreviewText(value) {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+  }
+}
 
 function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -445,18 +462,65 @@ app.registerExtension({
     const onCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = onCreated ? onCreated.apply(this, arguments) : undefined;
-      const div = el("div", {
+      const root = el("div", {
         width: "100%", minHeight: "80px", maxHeight: "620px", overflowY: "auto",
-        padding: "6px 10px", boxSizing: "border-box", background: "#14161c",
+        padding: "8px", boxSizing: "border-box", background: "#14161c",
         color: "#dfe3ea", border: "1px solid #2a2d36", borderRadius: "6px",
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
         fontSize: "11.5px", lineHeight: "1.5", wordBreak: "break-word",
       });
-      div.innerHTML = '<div style="color:#6b7280">(run the graph to see the assembled prompt)</div>';
-      this.mc_preview = div;
-      this.mc_widget = this.addDOMWidget("mc_report", "mc_report", div, { hideOnZoom: false });
+      const makeBlock = (title) => {
+        const section = el("section", {
+          border: "1px solid #323844", borderRadius: "6px", background: "#101318",
+          marginBottom: "9px", overflow: "hidden",
+        });
+        const header = el("div", {
+          display: "flex", alignItems: "center", gap: "7px", padding: "5px 8px",
+          borderBottom: "1px solid #323844",
+        });
+        header.appendChild(el("strong", { flex: "1", color: "#8ab4f8" }, { textContent: title }));
+        const button = (label) => el("button", {
+          background: "#3a3f4b", color: "#fff", border: "none", borderRadius: "4px",
+          padding: "2px 7px", cursor: "pointer", fontSize: "11px",
+        }, { textContent: label });
+        const mode = button("View markdown");
+        const copy = button("Copy");
+        for (const b of [mode, copy]) b.addEventListener("pointerdown", (e) => e.stopPropagation());
+        header.appendChild(mode);
+        header.appendChild(copy);
+        const raw = el("pre", {
+          margin: "0", padding: "8px", whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+          fontFamily: "inherit", fontSize: "inherit", lineHeight: "1.5",
+        }, { textContent: "" });
+        const markdown = el("div", { display: "none", padding: "8px" });
+        section.appendChild(header);
+        section.appendChild(raw);
+        section.appendChild(markdown);
+        root.appendChild(section);
+        const block = { section, raw, markdown, mode, value: "", markdownMode: false };
+        mode.addEventListener("click", () => {
+          block.markdownMode = !block.markdownMode;
+          raw.style.display = block.markdownMode ? "none" : "block";
+          markdown.style.display = block.markdownMode ? "block" : "none";
+          mode.textContent = block.markdownMode ? "View raw" : "View markdown";
+          this.setDirtyCanvas(true, true);
+        });
+        copy.addEventListener("click", async () => {
+          await copyPreviewText(block.value);
+          copy.textContent = "Copied";
+          setTimeout(() => (copy.textContent = "Copy"), 1200);
+        });
+        return block;
+      };
+      const positive = makeBlock("POSITIVE - exact encoder text");
+      const negative = makeBlock("NEGATIVE - exact encoder text");
+      const fallback = el("div", { display: "none" });
+      root.appendChild(fallback);
+      this.mc_preview = root;
+      this.mc_prompt_blocks = { positive, negative, fallback };
+      this.mc_widget = this.addDOMWidget("mc_report", "mc_report", root, { hideOnZoom: false });
       this.mc_widget.serialize = false;
-      this.mc_widget.computeSize = () => [this.size ? this.size[0] : 420, Math.min(620, (div.scrollHeight || 90) + 14)];
+      this.mc_widget.computeSize = () => [this.size ? this.size[0] : 420, Math.min(620, (root.scrollHeight || 90) + 14)];
       if (!this.size || this.size[0] < 380) this.size = [440, 340];
       return r;
     };
@@ -465,12 +529,26 @@ app.registerExtension({
     nodeType.prototype.onExecuted = function (message) {
       const r = onExec ? onExec.apply(this, arguments) : undefined;
       try {
-        let txt = "";
-        if (message && message.text) txt = Array.isArray(message.text) ? message.text.join("") : String(message.text);
-        if (this.mc_preview) {
-          this.mc_preview.innerHTML = mdToHtml(txt);
-          this.setDirtyCanvas(true, true);
+        const blocks = this.mc_prompt_blocks;
+        if (!blocks) return r;
+        const hasPrompts = message && (Array.isArray(message.has_prompts)
+          ? Boolean(message.has_prompts[0]) : Boolean(message.has_prompts));
+        if (hasPrompts) {
+          for (const [key, field] of [["positive", "positive_text"], ["negative", "negative_text"]]) {
+            const block = blocks[key];
+            block.value = previewValue(message[field]);
+            block.raw.textContent = block.value;
+            block.markdown.innerHTML = mdToHtml(block.value);
+            block.section.style.display = "block";
+          }
+          blocks.fallback.style.display = "none";
+        } else {
+          blocks.positive.section.style.display = "none";
+          blocks.negative.section.style.display = "none";
+          blocks.fallback.style.display = "block";
+          blocks.fallback.innerHTML = mdToHtml(previewValue(message && message.text));
         }
+        this.setDirtyCanvas(true, true);
       } catch (e) { console.error("[MultiCharPreview] render failed", e); }
       return r;
     };
@@ -487,7 +565,9 @@ app.registerExtension({
 const COMPOSE_NODE = "MultiCharPromptCompose";
 const COMPOSE_SETTINGS = ["subject_count_lock", "use_names", "bind_interactions",
   "cast_roster", "order_and_group", "auto_scale_hints", "spatial_detail",
-  "output_format", "auto_framing", "negative_mode", "global_positive", "global_negative"];
+  "output_format", "auto_framing", "negative_mode", "global_positive", "global_negative",
+  "prompt_profile", "negative_term_cap", "negative_cap_priority", "spatial_cues",
+  "scale_cues", "layout_json_override"];
 
 // in-node options guide (rendered with mdToHtml). No apostrophes so it stays
 // safe inside single-quoted JS strings; double quotes + backticks are literal.
@@ -528,6 +608,12 @@ const HELP_MD = [
   "**negative_mode** — per-character negatives (negatives are global on Chroma):",
   "- `global_dedup` (default) — merge and de-duplicate all negatives.",
   "- `to_positive_assertion` — convert a character negative into a positive counter-trait (\"old\" becomes \"young\") on that character. Often obeyed better than a negation.",
+  "",
+  "**prompt_profile** — `default` keeps the current prompt wording. `flux2` skips ambiguous placement and scale cues, removes exact repeated interaction clauses, and places interactions after their characters.",
+  "**negative_term_cap** — 0 keeps every negative term. Set a limit to keep only the first N terms in the selected priority order. Review dropped terms in the report.",
+  "**negative_cap_priority** — `global_first` keeps global negatives first; `interaction_first` gives link guards the first slots in flux2 mode.",
+  "**spatial_cues / scale_cues** — flux2 controls. Auto spatial cues skip a 1x1 or fully shared grid. Row-based scale cues are opt-in because vertical position may not mean depth.",
+  "**Layout JSON override** — paste a full layout and Apply to use it in this composer without changing the connected layout. Clear returns to the connected layout.",
 ].join("\n");
 
 // build the exact payload the backend expects from a compose node
@@ -543,7 +629,9 @@ function composeGather(node) {
         const gj = getWidget(src, "layout_json");
         try { parsed = JSON.parse(gj && gj.value ? gj.value : "{}"); } catch (e) { /* */ }
         layout.characters = parsed.characters || [];
-        layout.links = parsed.links || [];
+        layout.links = parsed.links || parsed.interactions || [];
+        layout.aspect = widgetVal(src, "aspect", parsed.aspect || "rectangle 1216x832");
+        layout.batch_size = parseInt(widgetVal(src, "batch_size", parsed.batch_size || 1)) || 1;
         layout.grid_cols = parseInt(widgetVal(src, "grid_cols", 3)) || 3;
         layout.grid_rows = parseInt(widgetVal(src, "grid_rows", 1)) || 1;
       }
@@ -559,6 +647,9 @@ function composeGather(node) {
 
 async function composeRefresh(node) {
   if (!node.mc_preview) return;
+  composeSyncLayoutJSON(node);
+  const requestId = (node._mcRefreshSeq || 0) + 1;
+  node._mcRefreshSeq = requestId;
   try {
     const resp = await api.fetchApi("/multichar/preview", {
       method: "POST",
@@ -566,12 +657,24 @@ async function composeRefresh(node) {
       body: JSON.stringify(composeGather(node)),
     });
     const data = await resp.json();
+    if (requestId !== node._mcRefreshSeq) return;
     node._lastReport = data.report || "";
     node.mc_preview.innerHTML = mdToHtml(node._lastReport || "(no preview)");
   } catch (e) {
+    if (requestId !== node._mcRefreshSeq) return;
     node.mc_preview.innerHTML = '<div style="color:#c0616b">preview unavailable: ' + escapeHtml(String(e)) + "</div>";
   }
   node.setDirtyCanvas(true, true);
+}
+
+function composeSyncLayoutJSON(node) {
+  const editor = node._composeLayoutEditor;
+  if (!editor || editor.dirty) return;
+  const override = String(widgetVal(node, "layout_json_override", "") || "");
+  editor.ta.value = override.trim() || JSON.stringify(composeGather(node).layout, null, 2);
+  editor.status.textContent = override.trim() ? "Local override active" : "Using connected layout";
+  editor.clear.disabled = !override.trim();
+  editor.apply.disabled = true;
 }
 
 function composeScheduleRefresh(node) {
@@ -671,6 +774,74 @@ app.registerExtension({
       const negTA = bigTextarea(self, "global_negative", "Global negative (avoid everywhere)", 90);
       this._taRefs = { global_positive: posTA, global_negative: negTA };
 
+      const layoutWrap = el("div", { marginTop: "8px" });
+      layoutWrap.appendChild(el("div", { fontSize: "10px", color: "#8b8f98", margin: "2px 0", textTransform: "uppercase", letterSpacing: ".04em" },
+        { textContent: "Layout JSON (edit / paste → Apply)" }));
+      const layoutTA = el("textarea", {
+        width: "100%", boxSizing: "border-box", background: "#161821", color: "#cfe3d6",
+        border: "1px solid #333", borderRadius: "5px", padding: "6px", fontSize: "11px",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", resize: "vertical",
+        minHeight: "120px", whiteSpace: "pre",
+      }, { spellcheck: false });
+      layoutTA.addEventListener("pointerdown", (e) => e.stopPropagation());
+      const layoutRow = el("div", { display: "flex", alignItems: "center", gap: "7px", margin: "4px 0" });
+      const applyLayout = mkBtn("Apply JSON layout");
+      const clearLayout = mkBtn("Clear override");
+      const copyLayout = mkBtn("Copy JSON");
+      const layoutStatus = el("span", { fontSize: "11px", color: "#9aa0aa", flex: "1" }, { textContent: "" });
+      const layoutError = el("div", { fontSize: "11px", color: "#c0616b" }, { textContent: "" });
+      this._composeLayoutEditor = { ta: layoutTA, status: layoutStatus, clear: clearLayout,
+        apply: applyLayout, dirty: false };
+      layoutTA.addEventListener("input", () => {
+        self._composeLayoutEditor.dirty = true;
+        applyLayout.disabled = false;
+        layoutError.textContent = "";
+      });
+      applyLayout.addEventListener("click", () => {
+        let parsed;
+        try { parsed = JSON.parse(layoutTA.value); }
+        catch (e) { layoutError.textContent = "Invalid JSON: " + e.message; return; }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+            (parsed.characters !== undefined && !Array.isArray(parsed.characters)) ||
+            (parsed.links !== undefined && !Array.isArray(parsed.links)) ||
+            (parsed.interactions !== undefined && !Array.isArray(parsed.interactions))) {
+          layoutError.textContent = "Characters and links must be arrays when present.";
+          return;
+        }
+        const w = getWidget(self, "layout_json_override");
+        if (w) w.value = layoutTA.value;
+        self._composeLayoutEditor.dirty = false;
+        layoutError.textContent = "";
+        self.setDirtyCanvas(true, true);
+        composeRefresh(self);
+      });
+      clearLayout.addEventListener("click", () => {
+        const w = getWidget(self, "layout_json_override");
+        if (w) w.value = "";
+        self._composeLayoutEditor.dirty = false;
+        layoutError.textContent = "";
+        self.setDirtyCanvas(true, true);
+        composeRefresh(self);
+      });
+      copyLayout.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(layoutTA.value); }
+        catch (e) { layoutTA.select(); document.execCommand("copy"); }
+      });
+      layoutRow.appendChild(applyLayout);
+      layoutRow.appendChild(clearLayout);
+      layoutRow.appendChild(copyLayout);
+      layoutRow.appendChild(layoutStatus);
+      layoutWrap.appendChild(layoutTA);
+      layoutWrap.appendChild(layoutRow);
+      layoutWrap.appendChild(layoutError);
+      const overrideWidget = getWidget(this, "layout_json_override");
+      if (overrideWidget) {
+        overrideWidget.hidden = true;
+        overrideWidget.computeSize = () => [0, -4];
+        if (overrideWidget.inputEl) overrideWidget.inputEl.style.display = "none";
+        if (overrideWidget.element) overrideWidget.element.style.display = "none";
+      }
+
       // rendered live-preview panel
       const div = el("div", {
         width: "100%", minHeight: "70px", maxHeight: "520px", overflowY: "auto",
@@ -686,6 +857,7 @@ app.registerExtension({
       root.appendChild(help);
       root.appendChild(posTA.wrap);
       root.appendChild(negTA.wrap);
+      root.appendChild(layoutWrap);
       root.appendChild(div);
 
       this.mc_widget = this.addDOMWidget("mc_ui", "mc_ui", root, { hideOnZoom: false });
@@ -695,7 +867,7 @@ app.registerExtension({
 
       // rebuild 3s after any setting widget changes (text areas handle their own)
       for (const w of (this.widgets || [])) {
-        if (w.name === "mc_ui" || w.name === "global_positive" || w.name === "global_negative") continue;
+        if (["mc_ui", "global_positive", "global_negative", "layout_json_override"].includes(w.name)) continue;
         const prev = w.callback;
         w.callback = function () {
           const rr = prev ? prev.apply(this, arguments) : undefined;
@@ -707,6 +879,7 @@ app.registerExtension({
       if (window.ResizeObserver) {
         try { new ResizeObserver(() => self.setDirtyCanvas(true, true)).observe(root); } catch (e) { /* */ }
       }
+      composeSyncLayoutJSON(this);
       composeScheduleRefresh(this);
       return r;
     };
@@ -735,6 +908,14 @@ app.registerExtension({
             }
           }
         }
+        const w = getWidget(this, "layout_json_override");
+        if (w) {
+          w.hidden = true;
+          w.computeSize = () => [0, -4];
+          if (w.inputEl) w.inputEl.style.display = "none";
+          if (w.element) w.element.style.display = "none";
+        }
+        if (this._composeLayoutEditor) this._composeLayoutEditor.dirty = false;
       } catch (e) { /* */ }
       composeScheduleRefresh(this);
       return r;

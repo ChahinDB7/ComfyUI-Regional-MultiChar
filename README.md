@@ -136,8 +136,24 @@ Wording-based alternative to masked conditioning. Assembles **one** natural-lang
 | `auto_framing` | OFF | Derives shot type from character spread (wide / medium) |
 | `negative_mode` | `global_dedup` | `global_dedup` = merge + deduplicate all negatives; `to_positive_assertion` = convert negatives to positive counter-traits ("old" → "young") |
 | `layout` | optional | From `RegionalCharacterLayout` |
+| `prompt_profile` | `default` | `default` keeps the current positive and negative text; `flux2` uses the cleanup rules below |
+| `negative_term_cap` | `0` | Maximum number of deduplicated negative terms; `0` keeps all terms |
+| `negative_cap_priority` | `global_first` | `global_first` keeps global terms before character and interaction terms; `interaction_first` puts interaction guards first in `flux2` |
+| `spatial_cues` | `auto` | In `flux2`, `auto` skips grid wording for a 1x1 grid or when all characters share the same cells; `always` forces it; `off` removes it |
+| `scale_cues` | `off` | In `flux2`, `row_based` allows the existing top=far/bottom=near scale hint; `off` avoids assuming that vertical position means depth |
+| `layout_json_override` | empty | Optional JSON pasted into the composer. When set, it replaces the connected layout for this node only |
 
 **Outputs:** `positive` (CONDITIONING), `negative` (CONDITIONING), `positive_text` (STRING), `negative_text` (STRING), `prompt_report` (STRING markdown).
+
+For Flux 2 Klein, start with `prompt_profile=flux2` and leave `negative_term_cap=0` for the first comparison. Set a cap only after checking which terms it drops in the report. `interaction_first` is useful when a long global negative would otherwise push contact or adjacency guards past the cap. The cap changes the negative prompt in either profile when you set it above zero.
+
+Check the sampler before tuning negatives. ComfyUI [skips the unconditional pass at CFG 1](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/samplers.py), so a workflow at that setting may ignore this node's negative output. The [reference Flux 2 Klein pipeline](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux2/pipeline_flux2_klein.py) also skips classifier-free guidance for distilled models. If negatives are inactive in your workflow, changing the cap cannot improve gaze or anatomy. Keep the negative text output for workflows that do use it.
+
+In `flux2`, the composer also skips a count-lock sentence if the global positive already states the same headcount, removes exact comma-separated clauses repeated between a character and its interaction, and places each interaction after the last group containing one of its members. It keeps unique interaction details. The wording is cleaned up at sentence joins. A plain role name such as `Mature Woman` becomes `the mature woman` in prose handles, while labeled and numbered character lines keep the name as entered.
+
+The node has its own **Layout JSON (edit / paste -> Apply)** box. It starts with the connected layout so you can copy it. Paste a revised layout and click **Apply JSON layout** to use it without changing the upstream editor or the masked-conditioning branch. **Clear override** returns to the connected layout. You can paste a full layout or just the fields you want to change. `characters` and `links` must be arrays when present; `interactions` is accepted as an alias for `links`. The composer reads `grid_cols`, `grid_rows`, `characters`, and `links`; `aspect` and `batch_size` can remain in copied JSON but do not affect its text output.
+
+Saved workflows without these widgets still use the old defaults. Existing node names, port order, layout JSON structure, and masked conditioning are unchanged.
 
 ---
 
@@ -145,7 +161,11 @@ Wording-based alternative to masked conditioning. Assembles **one** natural-lang
 
 **Internal name:** `MultiCharPromptPreview`
 
-Renders the `prompt_report` string (or any STRING) as formatted markdown inside the node panel. Also includes a live preview panel on the `MultiCharPromptCompose` node itself that POSTs to `/multichar/preview` and updates 3 seconds after any edit — no graph run needed.
+Connect `MultiCharPromptCompose.prompt_report` to the preview's existing `text` input. After a graph run, the preview extracts the final positive and negative strings from that report and shows them in separate **POSITIVE** and **NEGATIVE** blocks. These are the strings the composer passed to `clip.tokenize()`. Each block starts in raw-text mode, has its own **Copy** button, and can switch to a rendered Markdown view. An empty string stays blank; the preview does not put an `(empty)` placeholder in the encoder text.
+
+The preview also has optional `positive_text` and `negative_text` inputs. Connect the composer's matching outputs to them when you want the raw values passed directly, including prompts that contain Markdown code fences. The original `text` input and passthrough `text` output keep their positions, so saved workflows with only the `prompt_report` link still work. If `text` receives an unrelated Markdown string, the node renders it as before.
+
+The separate live preview panel on `MultiCharPromptCompose` still POSTs to `/multichar/preview` and updates 3 seconds after edits, without running the graph.
 
 ---
 
@@ -215,6 +235,7 @@ The visual editor in the node panel serializes everything into a single hidden w
 - A character with no cells (`[]`) receives a full-canvas mask (conditioned everywhere).
 
 A full-layout JSON (including `aspect`, `grid_cols`, `grid_rows`, `batch_size`) can be pasted into the "Layout JSON (edit / paste → Apply)" textarea in the editor to load the whole scene in one shot.
+The same JSON can be pasted into the composer override. In the composer, Apply changes only that composer; it does not update the grid editor or latent size.
 
 ---
 
@@ -272,6 +293,10 @@ This is a pure Python string-assembly function (no tensors, no CLIP, no masks). 
 6. **Interactions**: if `bind_interactions`, action fragments are prepended with "The X and Y are ..."; otherwise used verbatim.
 7. **Deduplication** (`_dedup_terms`): the final negative collects all per-character and global negatives, deduplicating by lowercased term.
 
+The `flux2` profile adds count-lock checks, exact clause deduplication, interaction placement after the last member group, and optional negative term limits. Its default scale setting does not infer depth from grid row because a character higher in the image is not necessarily farther away. `spatial_cues=always` and `scale_cues=row_based` restore those cues when they fit a scene.
+
+The report shows repeated clauses across blocks, profile adjustments, dropped negative terms, and rough length estimates. The token estimate uses character count divided by four; it is not the Flux tokenizer's actual count. A warning appears when that estimate passes 450 tokens so you can check the active encoder's context limit. The reference Klein pipeline uses a [512-token maximum by default](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux2/pipeline_flux2_klein.py); your ComfyUI path may differ.
+
 The output `{positive, negative, report}` dict is shared between the compose node and the live HTTP preview route.
 
 ---
@@ -310,8 +335,8 @@ Registered via `WEB_DIRECTORY = "./web"` in `__init__.py`. Three ComfyUI extensi
 | Extension name | Node | What it does |
 |---|---|---|
 | `Regional.MultiChar` | `RegionalCharacterLayout` | Injects the visual character/interaction/grid editor as a DOM widget |
-| `Regional.MultiCharPreview` | `MultiCharPromptPreview` | Injects a markdown-rendered read-only text panel |
-| `Regional.MultiCharComposeLive` | `MultiCharPromptCompose` | Injects live preview panel + bigger textareas; POSTs to `/multichar/preview` with 3-second debounce |
+| `Regional.MultiCharPreview` | `MultiCharPromptPreview` | Shows exact positive and negative strings in separate copyable raw-text blocks, with optional Markdown rendering |
+| `Regional.MultiCharComposeLive` | `MultiCharPromptCompose` | Adds the live preview, larger textareas, and a layout JSON override box; POSTs to `/multichar/preview` with a 3-second debounce |
 
 The editor stores its state in `node.k2` (a `{characters, links}` object). Every interactive change calls `save(node)`, which serialises `node.k2` to the hidden `layout_json` widget, then calls `node.setDirtyCanvas()` to mark the graph dirty. The raw `layout_json` textarea is hidden after a successful first render; if JavaScript fails, it remains visible as a plain editable fallback so the node always works.
 
@@ -385,5 +410,6 @@ KSampler → base_latent
 - **`merge_linked`** reduces the number of encoding passes: two linked characters become one region and are encoded once instead of three times (A + B + link). Useful for closely interacting characters.
 - **`auto_split`** only splits horizontally. If you need a vertical split (characters stacked), assign them to different rows.
 - **Pasting a full-layout JSON** into the "Layout JSON" textarea and clicking "Apply" sets all widgets (aspect, grid, characters, interactions) in one shot — useful for programmatic workflows (e.g. Stansa.ai output).
+- **Prompt cleanup is an experiment**: a shorter prompt can help, but exact clause removal cannot fix all contact geometry, and a term cap can remove a useful guard. Compare the same seeds and inspect the report before keeping a setting.
 - **`layout` is optional** on `RegionalMultiCharConditioning`: if not connected, the node produces global conditioning from the global prompts alone (no regions).
 - **LLM enhancer**: the model must be a HuggingFace directory with `config.json` and model weights under `models/LLM/`. Quantized GGUF files are not supported — use bfloat16 or float16 HF checkpoints.

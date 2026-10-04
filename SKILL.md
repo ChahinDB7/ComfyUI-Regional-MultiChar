@@ -2,6 +2,8 @@
 
 > **Purpose:** This document explains the core concepts, data flow, and technical mechanics of the *ComfyUI Regional MultiChar* custom node pack. It is written for use **outside** the repository — for AI assistants, integrators, and advanced users who interact with the nodes from within a ComfyUI environment but do not have direct access to the source files.
 
+When using this as `comfyui-multi-char.md` in another assistant's skill, load it before writing or revising a Regional MultiChar layout or prompt. It describes the JSON schema, the optional Flux 2 profile, and how to inspect the exact encoder text. Keep character appearance rules and scene-specific lessons in their own support files.
+
 ---
 
 ## What the Pack Does
@@ -98,16 +100,26 @@ A "full layout JSON" — adding `aspect`, `grid_cols`, `grid_rows`, `batch_size`
 | `output_format` | `prose` = flowing sentences; `labeled` = "Name (loc): ..."; `numbered` = "1) ...". |
 | `auto_framing` | Derives shot type from character spread (wide/medium shot). |
 | `negative_mode` | `global_dedup` = merge + deduplicate all negatives; `to_positive_assertion` = convert "old" → "young" directly in the positive. |
+| `prompt_profile` | `default` preserves the old positive and negative strings. `flux2` removes exact repeated interaction clauses, skips redundant count/location cues, and places an interaction after its last member group. |
+| `negative_term_cap` | `0` keeps all deduplicated negatives. A positive value keeps only the first N after priority ordering; inspect the report for dropped terms. |
+| `negative_cap_priority` | `global_first` keeps global, character, then interaction terms. `interaction_first` gives interaction guards priority when a cap is active in `flux2`. |
+| `spatial_cues` | In `flux2`: `auto` skips cues for a 1x1 grid or a fully shared cell selection; `always` forces them; `off` suppresses them. |
+| `scale_cues` | In `flux2`: `off` avoids treating grid row as depth; `row_based` restores the old top=far/bottom=near wording. |
+| `layout_json_override` | Optional full or partial JSON in the composer's **Layout JSON (edit / paste -> Apply)** box. Apply affects only this composer; Clear returns to the connected layout. |
 
 **Outputs:** `positive` (CONDITIONING), `negative` (CONDITIONING), `positive_text` (STRING), `negative_text` (STRING), `prompt_report` (STRING, structured markdown of every decision made).
 
-**Live preview:** A preview panel inside the node POSTs the current layout and settings to `/multichar/preview` (a backend HTTP route provided by the pack) every 3 seconds after any edit, showing the assembled prompt without running the graph.
+**Live preview:** A preview panel inside the node POSTs the current layout and settings to `/multichar/preview` (a backend HTTP route provided by the pack) every 3 seconds after any edit, showing the assembled prompt without running the graph. The report lists duplicate clauses, profile adjustments, dropped negative terms, and rough length estimates. Its token estimate is only a character-based approximation.
+
+**Layout copy/paste:** The compose node's JSON box starts with the connected layout. Copy it to revise it elsewhere, then paste and Apply. `characters` and `links` are arrays when present; `interactions` is accepted as an alias for `links`. `aspect` and `batch_size` may be present in a copied full layout but do not change the compose node's text output or latent size. A local override does not change `RegionalCharacterLayout` or masked conditioning.
 
 ---
 
 ### 4. `MultiCharPromptPreview` ("Multi-Char Prompt Preview (read-only)")
 
-A passthrough STRING node that renders its input as formatted markdown inside the node panel. Wire the `prompt_report` output from `MultiCharPromptCompose` into it to inspect the full assembler decision log.
+Connect `MultiCharPromptCompose.prompt_report` to the preview's required `text` input. On execution, it extracts the final positive and negative from the report and shows the exact raw strings in separate blocks. Each block has Copy and a Raw/Markdown view toggle. Blank encoder strings stay blank; the displayed values do not include `(empty)` placeholders.
+
+For prompts containing Markdown code fences, also connect `MultiCharPromptCompose.positive_text` and `.negative_text` to the preview's optional inputs of the same names. Those direct connections take priority over parsing the report and are the most reliable way to inspect exactly what `clip.tokenize()` received. The required `text` input remains at the same index, and the `text` output still passes its input through. Existing workflows that only connect `prompt_report` continue to work. Unrelated Markdown sent to `text` still renders as Markdown.
 
 ---
 
@@ -161,9 +173,11 @@ Each masked region feeds into ComfyUI's standard conditioning system via `Condit
 4. **Groups and orders** co-located characters and sorts groups left-to-right.
 5. **Serialises** each group using the chosen output format (prose / labeled / numbered).
 6. **Binds interactions**: action fragments ("kissing each other") are prepended with named subjects ("The woman and the man are kissing each other.").
-7. **Deduplicates negatives** across all characters and the global negative.
+7. **Deduplicates negatives** across the global, character, and interaction blocks.
 
-The same function is called during graph execution and by the live HTTP preview route — guaranteeing the preview never disagrees with what the sampler receives.
+In `flux2`, it also skips location cues when the grid gives no relative placement, avoids repeating a matching headcount, removes exact duplicate comma clauses from interactions, and puts each interaction after the last group containing a member. Row-based scale wording is off unless `scale_cues=row_based` because vertical position does not always imply depth. The output report contains the exact final positive and negative strings in separate fenced sections.
+
+The same assembler runs during graph execution and in the live HTTP preview route. The live preview reads the connected editor layout; if another node dynamically changes that layout during execution, use the graph-run preview with direct text connections to inspect the encoder strings.
 
 ### Composition Fraction
 
@@ -258,8 +272,11 @@ KSampler → base_latent ──────────────────�
 | Prevent dropped characters | `subject_count_lock=ON`, `cast_roster=ON` |
 | Best coherence | `use_names=handle`, `bind_interactions=ON`, `order_and_group=ON` |
 | Readability | `use_names=label`, `output_format=labeled` |
-| Depth perception | `auto_scale_hints=ON` (requires rows > 1) |
+| Row-based depth hint | In `default`, `auto_scale_hints=ON`; in `flux2`, also set `scale_cues=row_based` when higher rows really are farther away |
 | Avoid color words in negatives | `negative_mode=to_positive_assertion` |
+| Try concise Flux 2 wording | `prompt_profile=flux2`, `negative_term_cap=0` first; compare the same seeds |
+| Prioritize interaction guards under a cap | `prompt_profile=flux2`, `negative_cap_priority=interaction_first` |
+| Keep explicit grid wording in Flux 2 | `spatial_cues=always` |
 
 ---
 
@@ -275,3 +292,4 @@ KSampler → base_latent ──────────────────�
 - **`composition_frac=1.0`** (the default) keeps regions all the way through denoising. Lower values (0.5–0.7) reduce artefacts when characters strongly overlap in some regions.
 - **`merge_linked=ON`** makes sense only when characters genuinely interact and their masks should overlap. For separate characters it reduces the number of distinct regions (bad).
 - **Empty `between` list** on a link means the link region will have no cells (full-canvas mask). Always set `between` chips before writing an interaction positive.
+- **A negative cap is not a guaranteed fix.** Check the sampler: standard ComfyUI sampling at CFG 1 skips the unconditional pass, so the negative text may have no image effect. Inspect the report before capping terms, and test the same seeds before keeping `flux2` settings.
