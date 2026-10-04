@@ -150,6 +150,8 @@ Same pattern for hires second-pass latents. When OFF, the upscale + second KSamp
 
 Takes a decoded `IMAGE` and outputs a grayscale `IMAGE` when `enabled` is on (the default). It uses weighted RGB luminance, returns three equal RGB channels, and keeps an existing alpha channel. Inputs with fewer than three channels pass through unchanged. With `enabled` off, it passes the input through unchanged. Connect it after VAEDecode and after FaceDetailer or any other image pass that could add color, then send its output to Save Image. This is a post-processing filter; it does not change prompts, conditioning, or sampling.
 
+Optional controls appear below `enabled`: `grayscale_strength` (`0` to `1`, default `1`) mixes original color back in when below `1`; `brightness` (`-0.5` to `0.5`, default `0`) shifts the gray level; `contrast` (`0` to `2`, default `1`) changes tonal separation; and `black_lift` (`0` to `1`, default `0`) raises black toward gray while keeping white white. Tone adjustments run before the strength mix. For strict monochrome, keep strength at `1`. For a lighter manga print, start with `black_lift=0.05` to `0.15`. Saved workflows without these optional fields keep the previous output.
+
 ---
 
 ## Core Technical Concepts

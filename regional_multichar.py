@@ -444,6 +444,16 @@ class RegionalGrayscaleFilter:
             "required": {
                 "image": ("IMAGE",),
                 "enabled": ("BOOLEAN", {"default": True, "label_on": "grayscale", "label_off": "bypass"}),
+            },
+            "optional": {
+                "grayscale_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider",
+                    "tooltip": "0 keeps the input colors; 1 removes all color."}),
+                "brightness": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.01, "display": "slider",
+                    "tooltip": "Add or subtract brightness after converting to grayscale."}),
+                "contrast": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01, "display": "slider",
+                    "tooltip": "1 keeps the original contrast; lower values soften tones, higher values deepen them."}),
+                "black_lift": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider",
+                    "tooltip": "Raise black ink toward gray while leaving white areas white."}),
             }
         }
 
@@ -451,15 +461,22 @@ class RegionalGrayscaleFilter:
     RETURN_NAMES = ("image",)
     FUNCTION = "apply"
     CATEGORY = "Regional/image"
-    DESCRIPTION = "Convert a decoded image to grayscale. Keeps RGB output and preserves alpha if present."
+    DESCRIPTION = "Convert a decoded image to grayscale with optional strength and tone controls."
 
-    def apply(self, image, enabled=True):
-        if not enabled or image.shape[-1] < 3:
+    def apply(self, image, enabled=True, grayscale_strength=1.0, brightness=0.0,
+              contrast=1.0, black_lift=0.0):
+        if not enabled or grayscale_strength <= 0.0 or image.shape[-1] < 3:
             return (image,)
         gray = (image[..., 0:1] * 0.2126 +
                 image[..., 1:2] * 0.7152 +
                 image[..., 2:3] * 0.0722)
+        if contrast != 1.0 or brightness != 0.0:
+            gray = (gray * contrast + (0.5 - 0.5 * contrast + brightness)).clamp(0.0, 1.0)
+        if black_lift != 0.0:
+            gray = (gray * (1.0 - black_lift) + black_lift).clamp(0.0, 1.0)
         rgb = torch.cat((gray, gray, gray), dim=-1)
+        if grayscale_strength < 1.0:
+            rgb = image[..., :3] * (1.0 - grayscale_strength) + rgb * grayscale_strength
         if image.shape[-1] > 3:
             return (torch.cat((rgb, image[..., 3:]), dim=-1),)
         return (rgb,)

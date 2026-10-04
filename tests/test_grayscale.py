@@ -17,9 +17,16 @@ class ImageTensor:
         return ImageTensor([[value * factor for value in pixel] for pixel in self.pixels])
 
     def __add__(self, other):
+        if not isinstance(other, ImageTensor):
+            return ImageTensor([[value + other for value in pixel] for pixel in self.pixels])
         return ImageTensor([
             [left + right for left, right in zip(left_pixel, right_pixel)]
             for left_pixel, right_pixel in zip(self.pixels, other.pixels)
+        ])
+
+    def clamp(self, low, high):
+        return ImageTensor([
+            [max(low, min(high, value)) for value in pixel] for pixel in self.pixels
         ])
 
 
@@ -37,6 +44,7 @@ class GrayscaleTests(unittest.TestCase):
         node = module.RegionalGrayscaleFilter()
         image = ImageTensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
         self.assertIs(node.apply(image, False)[0], image)
+        self.assertIs(node.apply(image, grayscale_strength=0.0)[0], image)
         with patch.object(module.torch, "cat", concatenate, create=True):
             output = node.apply(image)[0]
         self.assertEqual(output.shape, image.shape)
@@ -54,12 +62,39 @@ class GrayscaleTests(unittest.TestCase):
             self.assertAlmostEqual(channel, 0.0722)
         self.assertEqual(output.pixels[0][3], 0.3)
 
+    def test_strength_and_tone_controls(self):
+        node = module.RegionalGrayscaleFilter()
+        with patch.object(module.torch, "cat", concatenate, create=True):
+            blended = node.apply(ImageTensor([[1.0, 0.0, 0.0]]),
+                                 grayscale_strength=0.5)[0]
+            lifted = node.apply(ImageTensor([[0.0, 0.0, 0.0],
+                                             [1.0, 1.0, 1.0]]), black_lift=0.2)[0]
+            softer = node.apply(ImageTensor([[0.0, 0.0, 0.0],
+                                             [1.0, 1.0, 1.0]]), contrast=0.5)[0]
+            brighter = node.apply(ImageTensor([[0.4, 0.4, 0.4]]), brightness=0.1)[0]
+        for actual, expected in zip(blended.pixels[0], (0.6063, 0.1063, 0.1063)):
+            self.assertAlmostEqual(actual, expected)
+        for channel in lifted.pixels[0]:
+            self.assertAlmostEqual(channel, 0.2)
+        for channel in lifted.pixels[1]:
+            self.assertAlmostEqual(channel, 1.0)
+        for channel in softer.pixels[0]:
+            self.assertAlmostEqual(channel, 0.25)
+        for channel in softer.pixels[1]:
+            self.assertAlmostEqual(channel, 0.75)
+        for channel in brighter.pixels[0]:
+            self.assertAlmostEqual(channel, 0.5)
+
     def test_registration_and_input_types(self):
         self.assertIs(module.NODE_CLASS_MAPPINGS["RegionalGrayscaleFilter"],
                       module.RegionalGrayscaleFilter)
         inputs = module.RegionalGrayscaleFilter.INPUT_TYPES()["required"]
         self.assertEqual(inputs["image"], ("IMAGE",))
         self.assertTrue(inputs["enabled"][1]["default"])
+        optional = module.RegionalGrayscaleFilter.INPUT_TYPES()["optional"]
+        self.assertEqual([optional[name][1]["default"] for name in optional],
+                         [1.0, 0.0, 1.0, 0.0])
+        self.assertTrue(all(config[1]["display"] == "slider" for config in optional.values()))
 
 
 if __name__ == "__main__":

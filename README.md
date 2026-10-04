@@ -213,6 +213,15 @@ Same pattern for hires second-pass latents. When OFF, the upscale + second KSamp
 
 Connect the final decoded `IMAGE` to this node, then connect its output to Save Image. Put it after FaceDetailer or any other image pass that might add color. With `enabled` on (the default), it converts RGB pixels to grayscale using weighted luminance and returns a three-channel image. It preserves an alpha channel if one is present. Inputs with fewer than three channels pass through unchanged. With `enabled` off, it passes the image through unchanged.
 
+| Tweak | Default | Effect |
+|---|---:|---|
+| `grayscale_strength` | `1.0` | `1.0` removes all color; `0.0` leaves the input unchanged. Values between them mix some original color back in. |
+| `brightness` | `0.0` | Adds or subtracts light after conversion. Range: `-0.5` to `0.5`. |
+| `contrast` | `1.0` | Below `1.0` softens dark and light tones; above `1.0` separates them more. Range: `0.0` to `2.0`. |
+| `black_lift` | `0.0` | Raises black toward gray without turning white darker. Range: `0.0` to `1.0`. |
+
+The tone controls run before the strength mix. For a lighter manga print, keep `grayscale_strength=1.0` and try `black_lift=0.05` to `0.15`. Increase `brightness` slightly if the whole image is too dark. The new tweaks are optional inputs; saved workflows without them use the defaults and produce the same grayscale as before.
+
 This is a final image filter. It catches colored pixels left in a manga image without changing the prompt, sampler, or other nodes. It cannot repair line art or anatomy.
 
 ---
