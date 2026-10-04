@@ -437,6 +437,34 @@ class RegionalHiresSwitch:
         return (with_hires if enable_hires else base,)
 
 
+class RegionalGrayscaleFilter:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "enabled": ("BOOLEAN", {"default": True, "label_on": "grayscale", "label_off": "bypass"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "apply"
+    CATEGORY = "Regional/image"
+    DESCRIPTION = "Convert a decoded image to grayscale. Keeps RGB output and preserves alpha if present."
+
+    def apply(self, image, enabled=True):
+        if not enabled or image.shape[-1] < 3:
+            return (image,)
+        gray = (image[..., 0:1] * 0.2126 +
+                image[..., 1:2] * 0.7152 +
+                image[..., 2:3] * 0.0722)
+        rgb = torch.cat((gray, gray, gray), dim=-1)
+        if image.shape[-1] > 3:
+            return (torch.cat((rgb, image[..., 3:]), dim=-1),)
+        return (rgb,)
+
+
 # ---------------------------------------------------------------------------
 # Wording-based multi-character composer (no masks) + a read-only prompt viewer.
 # The composer mirrors the RegionalCharacterLayout editor fields in plain text
@@ -1363,6 +1391,7 @@ NODE_CLASS_MAPPINGS = {
     "MultiCharLayoutEnhancer": MultiCharLayoutEnhancer,
     "RegionalFaceDetailerSwitch": RegionalFaceDetailerSwitch,
     "RegionalHiresSwitch": RegionalHiresSwitch,
+    "RegionalGrayscaleFilter": RegionalGrayscaleFilter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RegionalCharacterLayout": "Regional Characters (grid layout)",
@@ -1372,6 +1401,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MultiCharLayoutEnhancer": "Multi-Char Layout Enhancer (LLM, optional)",
     "RegionalFaceDetailerSwitch": "Regional FaceDetailer Toggle",
     "RegionalHiresSwitch": "Regional Hires Toggle",
+    "RegionalGrayscaleFilter": "Grayscale Filter (optional)",
 }
 
 

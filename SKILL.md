@@ -21,7 +21,7 @@ Both approaches share the same visual grid editor on the `RegionalCharacterLayou
 
 ---
 
-## The Seven Nodes
+## The Eight Nodes
 
 ### 1. `RegionalCharacterLayout` ("Regional Characters (grid layout)")
 
@@ -146,6 +146,12 @@ Same pattern for hires second-pass latents. When OFF, the upscale + second KSamp
 
 ---
 
+### 8. `RegionalGrayscaleFilter` ("Grayscale Filter (optional)")
+
+Takes a decoded `IMAGE` and outputs a grayscale `IMAGE` when `enabled` is on (the default). It uses weighted RGB luminance, returns three equal RGB channels, and keeps an existing alpha channel. Inputs with fewer than three channels pass through unchanged. With `enabled` off, it passes the input through unchanged. Connect it after VAEDecode and after FaceDetailer or any other image pass that could add color, then send its output to Save Image. This is a post-processing filter; it does not change prompts, conditioning, or sampling.
+
+---
+
 ## Core Technical Concepts
 
 ### How Masks Are Built
@@ -251,6 +257,8 @@ KSampler → base_latent ──────────────────�
     RegionalHiresSwitch ← enable_hires                      │
                 ↓ final latent
 ```
+
+For monochrome manga output, append `RegionalGrayscaleFilter → Save Image` after the final decoded or FaceDetailer image. Keep `enabled=true` to remove stray color, or set it to `false` to inspect the original image.
 
 ---
 

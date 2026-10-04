@@ -18,6 +18,7 @@ Place characters on a grid, give each one their own prompt, link two for an inte
    - [Multi-Char Layout Enhancer (LLM, optional)](#5-multi-char-layout-enhancer-llm-optional)
    - [Regional FaceDetailer Toggle](#6-regional-facedetailer-toggle)
    - [Regional Hires Toggle](#7-regional-hires-toggle)
+   - [Grayscale Filter (optional)](#8-grayscale-filter-optional)
 4. [Technical Deep-Dive](#technical-deep-dive)
    - [Layout JSON Schema](#layout-json-schema)
    - [Mask Building Pipeline](#mask-building-pipeline)
@@ -51,7 +52,7 @@ Both approaches share the same visual grid editor.
    ```
    ComfyUI/custom_nodes/ComfyUI-Regional-MultiChar/
    ```
-2. Restart ComfyUI. The nodes appear under **Regional/conditioning**.
+2. Restart ComfyUI. Conditioning nodes appear under **Regional/conditioning**; the grayscale filter appears under **Regional/image**.
 
 No additional Python packages are required for the core nodes. The optional `MultiCharLayoutEnhancer` node also requires `transformers` (already present in most ComfyUI environments).
 
@@ -203,6 +204,16 @@ A single boolean that selects between a base image (no FaceDetailer) and an imag
 **Internal name:** `RegionalHiresSwitch`
 
 Same pattern for hires second-pass latents. When OFF, the upscale + second KSampler branch is completely skipped.
+
+---
+
+### 8. Grayscale Filter (optional)
+
+**Internal name:** `RegionalGrayscaleFilter`
+
+Connect the final decoded `IMAGE` to this node, then connect its output to Save Image. Put it after FaceDetailer or any other image pass that might add color. With `enabled` on (the default), it converts RGB pixels to grayscale using weighted luminance and returns a three-channel image. It preserves an alpha channel if one is present. Inputs with fewer than three channels pass through unchanged. With `enabled` off, it passes the image through unchanged.
+
+This is a final image filter. It catches colored pixels left in a manga image without changing the prompt, sampler, or other nodes. It cannot repair line art or anatomy.
 
 ---
 
@@ -370,6 +381,8 @@ RegionalCharacterLayout  →  layout
                                 ↓
                              VAEDecode → image
 ```
+
+For a black-and-white manga result, connect `VAEDecode → Grayscale Filter → Save Image`. If you use FaceDetailer, put the filter after its final image output so that pass cannot reintroduce color.
 
 ### With optional LLM enrichment
 
