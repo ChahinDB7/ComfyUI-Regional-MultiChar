@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 torch = types.ModuleType("torch")
@@ -61,6 +62,89 @@ class ComposeTests(unittest.TestCase):
         )
         self.assertIn("## Duplication audit", result["report"])
         self.assertIn("## Length stats", result["report"])
+
+    def test_migrating_old_character_fields_keeps_prompt_text(self):
+        structured = []
+        for character in self.characters:
+            migrated = {key: value for key, value in character.items()
+                        if key not in ("positive", "negative")}
+            migrated["generic_positive"] = character["positive"]
+            migrated["generic_negative"] = character["negative"]
+            structured.append(migrated)
+        for profile in ("default", "flux2"):
+            old = module.assemble_multichar(
+                1, 1, self.characters, self.links, self.options, prompt_profile=profile
+            )
+            new = module.assemble_multichar(
+                1, 1, structured, self.links, self.options, prompt_profile=profile
+            )
+            self.assertEqual((new["positive"], new["negative"]),
+                             (old["positive"], old["negative"]))
+
+    def test_structured_character_fields_feed_both_composers(self):
+        character = {
+            "name": "Mature Woman", "cells": [0],
+            "generic_positive": "a woman",
+            "looks_positive": "dark hair, tailored coat",
+            "pose_action_positive": "leaning forward",
+            "generic_negative": "extra person",
+            "looks_negative": "red coat",
+            "pose_action_negative": "arms crossed",
+        }
+        self.assertEqual(module._character_prompt(character, "positive"),
+                         "a woman, dark hair, tailored coat, leaning forward")
+        self.assertEqual(module._character_prompt(character, "negative"),
+                         "extra person, red coat, arms crossed")
+        result = module.assemble_multichar(
+            1, 1, [character], [], {"subject_count_lock": False, "cast_roster": False},
+            prompt_profile="flux2"
+        )
+        self.assertIn("dark hair, tailored coat, leaning forward", result["positive"])
+        self.assertIn("extra person, red coat, arms crossed", result["negative"])
+        regions = module.RegionalMultiCharConditioning()._regions([character], [], False)
+        self.assertEqual(regions[0]["positive"], module._character_prompt(character, "positive"))
+        self.assertEqual(regions[0]["negative"], module._character_prompt(character, "negative"))
+        merged = module.RegionalMultiCharConditioning()._regions([character], [], True)
+        self.assertEqual(merged[0]["positive"], regions[0]["positive"])
+        self.assertEqual(merged[0]["negative"], regions[0]["negative"])
+
+    def test_legacy_positive_overrides_mixed_structured_fields(self):
+        character = {"positive": "legacy text", "negative": "legacy guard",
+                     "generic_positive": "different text", "looks_positive": "red hair",
+                     "generic_negative": "different guard"}
+        self.assertEqual(module._character_prompt(character, "positive"), "legacy text")
+        self.assertEqual(module._character_prompt(character, "negative"), "legacy guard")
+
+    def test_layout_bundle_keeps_legacy_prompt_aliases(self):
+        default = json.loads(module.RegionalCharacterLayout.INPUT_TYPES()
+                             ["required"]["layout_json"][1]["default"])
+        self.assertTrue(default["structured_characters"])
+        self.assertEqual(module._character_prompt(default["characters"][0], "positive"),
+                         "1girl, solo focus")
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        management = types.ModuleType("comfy.model_management")
+        management.intermediate_device = lambda: "cpu"
+        management.intermediate_dtype = lambda: "float32"
+        comfy.model_management = management
+        character = {"name": "A", "cells": [0], "generic_positive": "a woman",
+                     "looks_positive": "dark hair", "pose_action_positive": "walking",
+                     "generic_negative": "extra limb"}
+        raw = json.dumps({"structured_characters": True, "characters": [character], "links": []})
+        with patch.dict(sys.modules, {"comfy": comfy, "comfy.model_management": management}), \
+                patch.object(module.torch, "zeros", lambda *args, **kwargs: "latent", create=True):
+            layout, latent = module.RegionalCharacterLayout().make(
+                "rectangle 1216x832", 1, 1, 1, raw
+            )
+            legacy_layout, _ = module.RegionalCharacterLayout().make(
+                "rectangle 1216x832", 1, 1, 1,
+                json.dumps({"characters": self.characters[:1], "links": []})
+            )
+        self.assertEqual(latent["samples"], "latent")
+        self.assertEqual(layout["characters"][0]["positive"], "a woman, dark hair, walking")
+        self.assertEqual(layout["characters"][0]["negative"], "extra limb")
+        self.assertEqual(layout["characters"][0]["looks_positive"], "dark hair")
+        self.assertEqual(legacy_layout["characters"], self.characters[:1])
 
     def test_flux2_trims_redundancy_and_keeps_link_geometry(self):
         result = module.assemble_multichar(

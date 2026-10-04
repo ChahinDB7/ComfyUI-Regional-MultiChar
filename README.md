@@ -83,6 +83,8 @@ The entry point for both pipelines. Defines the canvas aspect, the grid dimensio
 
 The `REGIONAL_LAYOUT` type is a plain Python `dict` — not a tensor — passed between nodes as a structured bundle.
 
+The **Structured character prompts** checkbox above the character cards is on by default. Each character then has six text fields: Generic, Looks, and Pose / action, each with a positive and negative field. Keep recurring appearance details in Looks and change Pose / action for each scene. Interactions keep their existing positive and negative fields. Turn the checkbox off to edit characters with the older two-field layout. Switching off combines the three positive fields into `positive` and the three negative fields into `negative`; switching on again puts the combined text in Generic, so copy the JSON first if you need to preserve the separation.
+
 ---
 
 ### 2. Regional Multi-Char Conditioning
@@ -156,7 +158,7 @@ The composer has a **Prompt settings JSON (edit / paste -> Apply)** box. It show
 
 Older workflows with a nonempty `layout_json_override` still use that override. The composer shows a notice and a **Clear old override** button when one is active. New settings JSON does not create a layout override.
 
-Saved workflows without these widgets still use the old defaults. Existing node names, port order, layout JSON structure, and masked conditioning are unchanged.
+Saved workflows without these widgets still use the old defaults. Existing node names and port order are unchanged. Old two-field character JSON remains valid alongside the new structured format.
 
 ---
 
@@ -176,7 +178,7 @@ The separate live preview panel on `MultiCharPromptCompose` still POSTs to `/mul
 
 **Internal name:** `MultiCharLayoutEnhancer`
 
-Enriches each character's `positive` (and each interaction's `positive`) in a layout using a local HuggingFace instruct LLM. Drop an HF model directory under `models/LLM/` and it appears in the dropdown.
+Enriches each character's combined positive prompt (and each interaction's `positive`) in a layout using a local HuggingFace instruct LLM. For structured characters, its output is a runtime `positive` override; the upstream editor's six fields stay unchanged. Drop an HF model directory under `models/LLM/` and it appears in the dropdown.
 
 | Widget | Description |
 |---|---|
@@ -234,12 +236,17 @@ The visual editor in the node panel serializes everything into a single hidden w
 
 ```json
 {
+  "structured_characters": true,
   "characters": [
     {
       "name": "mother",
       "cells": [0, 3, 6],
-      "positive": "1girl, long hair, red dress",
-      "negative": "old"
+      "generic_positive": "1girl",
+      "looks_positive": "long hair, red dress",
+      "pose_action_positive": "walking forward",
+      "generic_negative": "extra person",
+      "looks_negative": "wrong outfit",
+      "pose_action_negative": "sitting"
     }
   ],
   "links": [
@@ -255,6 +262,9 @@ The visual editor in the node panel serializes everything into a single hidden w
 - **`cells`** — zero-based flat cell indices (`row * cols + col`). Cell 0 is top-left; cell `cols-1` is top-right.
 - **`between`** — 1-based character indices matching the card order in the editor.
 - A character with no cells (`[]`) receives a full-canvas mask (conditioned everywhere).
+- **`structured_characters`** — defaults to `true` when missing. In that mode, the editor moves old character `positive` and `negative` text into `generic_positive` and `generic_negative` without changing the prompt. Set it to `false` to keep character `positive` and `negative` keys instead.
+- Character text is combined as Generic, Looks, then Pose / action. The runtime layout bundle also provides combined `positive` and `negative` values for nodes that read the old keys. Links are unchanged.
+- Use one character format at a time in pasted JSON. If old and structured fields are both present, a nonempty old `positive` or `negative` wins for that side and moves to Generic in the editor.
 
 A full-layout JSON (including `aspect`, `grid_cols`, `grid_rows`, `batch_size`) can be pasted into the "Layout JSON (edit / paste -> Apply)" textarea in the `RegionalCharacterLayout` editor to load the whole scene in one shot. The composer JSON box accepts prompt settings instead of layout fields.
 
@@ -359,7 +369,7 @@ Registered via `WEB_DIRECTORY = "./web"` in `__init__.py`. Three ComfyUI extensi
 | `Regional.MultiCharPreview` | `MultiCharPromptPreview` | Shows exact positive and negative strings in separate copyable raw-text blocks, with optional Markdown rendering |
 | `Regional.MultiCharComposeLive` | `MultiCharPromptCompose` | Adds the live preview, larger textareas, and a prompt settings JSON box; POSTs to `/multichar/preview` with a 3-second debounce |
 
-The editor stores its state in `node.k2` (a `{characters, links}` object). Every interactive change calls `save(node)`, which serialises `node.k2` to the hidden `layout_json` widget, then calls `node.setDirtyCanvas()` to mark the graph dirty. The raw `layout_json` textarea is hidden after a successful first render; if JavaScript fails, it remains visible as a plain editable fallback so the node always works.
+The editor stores its state in `node.k2` (a `{structured_characters, characters, links}` object). Every interactive change calls `save(node)`, which serialises `node.k2` to the hidden `layout_json` widget, then calls `node.setDirtyCanvas()` to mark the graph dirty. The raw `layout_json` textarea is hidden after a successful first render; if JavaScript fails, it remains visible as a plain editable fallback so the node always works.
 
 The grid cells inside each character card are drawn as CSS grid divs sized to the real image aspect ratio (not the grid's own aspect), so the editor preview matches what the image will look like.
 

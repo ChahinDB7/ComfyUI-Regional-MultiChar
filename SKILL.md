@@ -37,12 +37,17 @@ All data lives in a hidden widget called `layout_json`. The visual editor (chara
 **Layout JSON schema:**
 ```json
 {
+  "structured_characters": true,
   "characters": [
     {
       "name": "label (optional)",
       "cells": [0, 3, 6],
-      "positive": "character appearance and actions",
-      "negative": "things to avoid for this character"
+      "generic_positive": "general character prompt",
+      "looks_positive": "stable appearance and outfit",
+      "pose_action_positive": "current pose and action",
+      "generic_negative": "general things to avoid",
+      "looks_negative": "appearance mistakes to avoid",
+      "pose_action_negative": "pose mistakes to avoid"
     }
   ],
   "links": [
@@ -57,6 +62,8 @@ All data lives in a hidden widget called `layout_json`. The visual editor (chara
 - `cells` are **zero-based flat indices**: `cell_index = row * grid_cols + col`. Cell 0 is top-left; indices increase left-to-right, top-to-bottom.
 - `between` values are **1-based character indices** matching card order.
 - A character with an empty `cells` list receives a full-canvas mask (conditioned everywhere).
+
+The editor's **Structured character prompts** checkbox is on by default. It applies only to character cards; interactions always use `positive` and `negative`. Character prompt fields combine in this order: Generic, Looks, Pose / action. Put stable identity details in Looks and scene-specific body wording in Pose / action. An old layout with character `positive` and `negative` and no checkbox setting is loaded into `generic_positive` and `generic_negative`; its assembled prompt stays the same. Set `structured_characters` to `false` for the legacy two-field character format. Switching off merges the three categories into `positive` and `negative`; switching on again puts the merged text into Generic, so save a JSON copy if you need the categories later. The runtime `REGIONAL_LAYOUT` bundle provides combined `positive` and `negative` aliases for structured characters so existing consumers can still read them. In pasted JSON, use one character format at a time. If both are present, a nonempty legacy `positive` or `negative` wins for that side.
 
 A "full layout JSON" — adding `aspect`, `grid_cols`, `grid_rows`, `batch_size` to the above — can be pasted into the visible JSON textarea and applied in one shot. This is the programmatic interface for external tools (e.g. Stansa.ai).
 
@@ -126,7 +133,7 @@ For prompts containing Markdown code fences, also connect `MultiCharPromptCompos
 
 ### 5. `MultiCharLayoutEnhancer` ("Multi-Char Layout Enhancer (LLM, optional)")
 
-Rewrites each character's `positive` and each interaction's `positive` in the layout using a local HuggingFace instruct LLM (placed under `models/LLM/`). The enriched layout is passed downstream to `MultiCharPromptCompose`, which handles structure (count-lock, placement, interaction binding); the enhancer only makes descriptions richer.
+Rewrites each character's combined positive text and each interaction's `positive` in the layout using a local HuggingFace instruct LLM (placed under `models/LLM/`). For a structured character, the enhancer writes the rewritten text to a runtime `positive` override; the upstream editor's six fields stay unchanged. The enriched layout is passed downstream to `MultiCharPromptCompose`, which handles structure (count-lock, placement, interaction binding).
 
 - `enable = OFF` is a passthrough — safe to leave in any graph.
 - Frees ComfyUI's GPU models before loading the LLM; frees the LLM before returning.

@@ -24,9 +24,14 @@ import node_helpers
 
 # A default scene so a freshly-dropped node already shows how the editor works.
 DEFAULT_LAYOUT = {
+    "structured_characters": True,
     "characters": [
-        {"name": "A", "cells": [0, 3, 6], "positive": "1girl, solo focus", "negative": ""},
-        {"name": "B", "cells": [2, 5, 8], "positive": "1boy, solo focus", "negative": ""},
+        {"name": "A", "cells": [0, 3, 6], "generic_positive": "1girl, solo focus",
+         "looks_positive": "", "pose_action_positive": "", "generic_negative": "",
+         "looks_negative": "", "pose_action_negative": ""},
+        {"name": "B", "cells": [2, 5, 8], "generic_positive": "1boy, solo focus",
+         "looks_positive": "", "pose_action_positive": "", "generic_negative": "",
+         "looks_negative": "", "pose_action_negative": ""},
     ],
     "links": [],
 }
@@ -50,6 +55,29 @@ def _parse_layout(raw):
     chars = data.get("characters") or []
     links = data.get("links") or []
     return chars, links
+
+
+_CHARACTER_POSITIVE_FIELDS = ("generic_positive", "looks_positive", "pose_action_positive")
+_CHARACTER_NEGATIVE_FIELDS = ("generic_negative", "looks_negative", "pose_action_negative")
+
+
+def _character_prompt(character, polarity):
+    """Read either character format without changing legacy prompt text."""
+    legacy = (character.get(polarity) or "").strip()
+    if legacy:
+        return legacy
+    fields = (_CHARACTER_POSITIVE_FIELDS if polarity == "positive"
+              else _CHARACTER_NEGATIVE_FIELDS)
+    parts = [(character.get(key) or "").strip() for key in fields]
+    parts = [part for part in parts if part]
+    if polarity == "negative":
+        return ", ".join(parts)
+    result = ""
+    for part in parts:
+        if result:
+            result += " " if result.endswith((".", "!", "?")) else ", "
+        result += part
+    return result
 
 
 def _gaussian_blur(mask, radius):
@@ -180,7 +208,7 @@ def _render_preview_from_masks(masks, labels, cols, rows, height, width):
 
 class RegionalCharacterLayout:
     """Grid + character/interaction editor. Pick an aspect, place characters on a
-    grid (each with its own positive/negative), link two for an interaction.
+    grid with structured or legacy prompts, then link them for an interaction.
     Outputs the layout bundle plus a matching empty SDXL latent."""
 
     ASPECTS = {
@@ -217,13 +245,20 @@ class RegionalCharacterLayout:
         import comfy.model_management as mm
         w, h = self.ASPECTS.get(aspect, (1216, 832))
         chars, links = _parse_layout(layout_json)
+        runtime_chars = []
+        for character in chars:
+            item = dict(character)
+            if any(key in item for key in _CHARACTER_POSITIVE_FIELDS + _CHARACTER_NEGATIVE_FIELDS):
+                item["positive"] = _character_prompt(item, "positive")
+                item["negative"] = _character_prompt(item, "negative")
+            runtime_chars.append(item)
         latent = {
             "samples": torch.zeros(
                 [batch_size, 4, h // 8, w // 8],
                 device=mm.intermediate_device(), dtype=mm.intermediate_dtype()),
         }
         bundle = {"grid_cols": grid_cols, "grid_rows": grid_rows,
-                  "width": w, "height": h, "characters": chars, "links": links}
+                  "width": w, "height": h, "characters": runtime_chars, "links": links}
         return (bundle, latent)
 
 
@@ -272,8 +307,8 @@ class RegionalMultiCharConditioning:
         links = links or []
         if not merge_linked:
             regions = [{"cells": c.get("cells", []),
-                        "positive": (c.get("positive") or "").strip(),
-                        "negative": (c.get("negative") or "").strip()} for c in chars]
+                        "positive": _character_prompt(c, "positive"),
+                        "negative": _character_prompt(c, "negative")} for c in chars]
             for ln in links:
                 union = set()
                 for b in ln.get("between", []):
@@ -308,8 +343,8 @@ class RegionalMultiCharConditioning:
         regions = []
         for root, idxs in comps.items():
             cells = sorted(set().union(*[set(chars[i].get("cells", [])) for i in idxs])) if idxs else []
-            tp = [chars[i].get("positive") or "" for i in idxs] + [l.get("positive") or "" for l in comp_links.get(root, [])]
-            tn = [chars[i].get("negative") or "" for i in idxs] + [l.get("negative") or "" for l in comp_links.get(root, [])]
+            tp = [_character_prompt(chars[i], "positive") for i in idxs] + [l.get("positive") or "" for l in comp_links.get(root, [])]
+            tn = [_character_prompt(chars[i], "negative") for i in idxs] + [l.get("negative") or "" for l in comp_links.get(root, [])]
             regions.append({"cells": cells,
                             "positive": ", ".join(t.strip() for t in tp if t.strip()),
                             "negative": ", ".join(t.strip() for t in tn if t.strip())})
@@ -816,14 +851,14 @@ def assemble_multichar(cols, rows, raw_chars, links, opts, *, prompt_profile="de
     # position so interaction links (which reference it) still resolve.
     chars = []
     for i, c in enumerate(raw_chars):
-        p = (c.get("positive") or "").strip()
+        p = _character_prompt(c, "positive")
         if not p:
             continue
         chars.append({
             "ref": i + 1,
             "name": (c.get("name") or "").strip(),
             "positive": p,
-            "negative": (c.get("negative") or "").strip(),
+            "negative": _character_prompt(c, "negative"),
             "cells": [x for x in (c.get("cells") or []) if isinstance(x, int)],
             "pos_add": [],
         })
@@ -1379,8 +1414,9 @@ class MultiCharLayoutEnhancer:
         try:
             if enrich_characters:
                 for c in lay.get("characters", []):
-                    if (c.get("positive") or "").strip():
-                        c["positive"] = gen(SYS_C, c["positive"], int(max_words) * 3)
+                    source = _character_prompt(c, "positive")
+                    if source:
+                        c["positive"] = gen(SYS_C, source, int(max_words) * 3)
                         rep.append("- %s: %s" % (c.get("name", "?"), c["positive"]))
             if enrich_interactions:
                 for l in lay.get("links", []):

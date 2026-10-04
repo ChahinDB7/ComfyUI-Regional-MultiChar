@@ -1,8 +1,8 @@
 // Dynamic editor for the RegionalCharacterLayout node.
 //
-// Renders an add/remove list of character cards (each with a clickable grid to
-// place the character + its own positive/negative text) and interaction cards
-// (link two or more characters + shared positive/negative text). All of it is
+// Renders character cards with a grid and either six prompt fields or the old
+// positive/negative pair. Interaction cards still link characters and hold one
+// positive/negative pair. All of it is
 // serialized into the node's hidden `layout_json` widget, which is what the
 // Python side reads. If this script fails to load, that widget stays visible as
 // a plain JSON textarea so the node still works -- nothing here is load-bearing
@@ -45,28 +45,70 @@ function imageAspect(node) {
   return m ? { w: parseInt(m[1]), h: parseInt(m[2]) } : { w: 1216, h: 832 };
 }
 
-function blankChar() {
-  return { name: "", cells: [], positive: "", negative: "" };
+const CHARACTER_POSITIVE_FIELDS = ["generic_positive", "looks_positive", "pose_action_positive"];
+const CHARACTER_NEGATIVE_FIELDS = ["generic_negative", "looks_negative", "pose_action_negative"];
+
+function characterPrompt(ch, polarity) {
+  const legacy = String(ch[polarity] || "").trim();
+  if (legacy) return legacy;
+  const fields = polarity === "positive" ? CHARACTER_POSITIVE_FIELDS : CHARACTER_NEGATIVE_FIELDS;
+  const parts = fields.map((name) => String(ch[name] || "").trim()).filter(Boolean);
+  if (polarity === "negative") return parts.join(", ");
+  let result = "";
+  for (const part of parts) {
+    if (result) result += /[.!?]$/.test(result) ? " " : ", ";
+    result += part;
+  }
+  return result;
+}
+
+function normalizeCharacter(ch, structured) {
+  const base = { name: ch.name || "", cells: Array.isArray(ch.cells) ? ch.cells.filter(Number.isInteger) : [] };
+  if (!structured) return {
+    ...base,
+    positive: typeof ch.positive === "string" && ch.positive ? ch.positive : characterPrompt(ch, "positive"),
+    negative: typeof ch.negative === "string" && ch.negative ? ch.negative : characterPrompt(ch, "negative"),
+  };
+  const oldPos = String(ch.positive || "");
+  const oldNeg = String(ch.negative || "");
+  return {
+    ...base,
+    generic_positive: oldPos.trim() ? oldPos : String(ch.generic_positive || ""),
+    looks_positive: oldPos.trim() ? "" : String(ch.looks_positive || ""),
+    pose_action_positive: oldPos.trim() ? "" : String(ch.pose_action_positive || ""),
+    generic_negative: oldNeg.trim() ? oldNeg : String(ch.generic_negative || ""),
+    looks_negative: oldNeg.trim() ? "" : String(ch.looks_negative || ""),
+    pose_action_negative: oldNeg.trim() ? "" : String(ch.pose_action_negative || ""),
+  };
+}
+
+function blankChar(structured = true) {
+  return normalizeCharacter({ name: "", cells: [] }, structured);
 }
 
 function loadState(node) {
-  let data = { characters: [], links: [] };
+  let data = { structured_characters: true, characters: [], links: [] };
+  let migrated = false;
   const w = getWidget(node, "layout_json");
   if (w && w.value) {
     try {
       const p = JSON.parse(w.value);
+      if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("Layout JSON must be an object");
+      data.structured_characters = p.structured_characters !== false;
       // normalize so a malformed entry (e.g. a null in characters) can't make
       // render() throw later and strand the user with a hidden raw widget
-      data.characters = (Array.isArray(p.characters) ? p.characters : [])
-        .filter((c) => c && typeof c === "object")
-        .map((c) => ({
-          name: c.name || "",
-          cells: Array.isArray(c.cells) ? c.cells.filter(Number.isInteger) : [],
-          positive: c.positive || "",
-          negative: c.negative || "",
-        }));
-      data.links = (Array.isArray(p.links) ? p.links : [])
-        .filter((l) => l && typeof l === "object")
+      const sourceChars = Array.isArray(p.characters) ? p.characters : [];
+      const sourceLinks = Array.isArray(p.links) ? p.links : [];
+      const rawChars = sourceChars.filter((c) => c && typeof c === "object" && !Array.isArray(c));
+      data.characters = rawChars.map((c) => normalizeCharacter(c, data.structured_characters));
+      const safeToMigrate = (p.characters === undefined || Array.isArray(p.characters)) &&
+        (p.links === undefined || Array.isArray(p.links)) &&
+        rawChars.length === sourceChars.length &&
+        sourceLinks.every((l) => l && typeof l === "object" && !Array.isArray(l));
+      migrated = safeToMigrate && (typeof p.structured_characters !== "boolean" ||
+        (data.structured_characters && rawChars.some((c) => "positive" in c || "negative" in c)));
+      data.links = sourceLinks
+        .filter((l) => l && typeof l === "object" && !Array.isArray(l))
         .map((l) => ({
           between: Array.isArray(l.between) ? l.between.filter(Number.isInteger) : [],
           positive: l.positive || "",
@@ -76,8 +118,9 @@ function loadState(node) {
       /* keep empty, raw widget still holds the bad text */
     }
   }
-  if (!data.characters.length) data.characters = [blankChar()];
+  if (!data.characters.length) data.characters = [blankChar(data.structured_characters)];
   node.k2 = data;
+  return migrated;
 }
 
 function save(node) {
@@ -98,7 +141,7 @@ function dropInvalidCells(node) {
   }
 }
 
-// ---- full-layout JSON (aspect + grid + characters + links), for paste/sync ----
+// ---- full-layout JSON (aspect, grid, character mode, cards, links) ----
 // One object describing the WHOLE scene, so it can be copy-pasted (e.g. built by
 // Stansa.ai) and applied in one shot, and kept in sync with the editor controls.
 function fullLayout(node) {
@@ -108,6 +151,7 @@ function fullLayout(node) {
     grid_cols: g.cols,
     grid_rows: g.rows,
     batch_size: parseInt(widgetVal(node, "batch_size", 1)) || 1,
+    structured_characters: node.k2 ? node.k2.structured_characters !== false : true,
     characters: (node.k2 && node.k2.characters) || [],
     links: (node.k2 && node.k2.links) || [],
   };
@@ -122,6 +166,9 @@ function applyLayoutJSON(node, text) {
   let data;
   try { data = JSON.parse(text); } catch (e) { return "Invalid JSON: " + e.message; }
   if (!data || typeof data !== "object" || Array.isArray(data)) return "JSON must be an object";
+  if (data.structured_characters !== undefined && typeof data.structured_characters !== "boolean") {
+    return "structured_characters must be true or false";
+  }
   const setW = (name, val) => { const w = getWidget(node, name); if (w && val !== undefined && val !== null) w.value = val; };
   const clampInt = (v, lo, hi, cur) => { const n = parseInt(v); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : cur; };
 
@@ -140,17 +187,20 @@ function applyLayoutJSON(node, text) {
   if (data.grid_rows !== undefined) setW("grid_rows", clampInt(data.grid_rows, 1, 8, grid(node).rows));
   if (data.batch_size !== undefined) setW("batch_size", clampInt(data.batch_size, 1, 64, 1));
 
-  const normChars = (arr) => (Array.isArray(arr) ? arr : []).filter((c) => c && typeof c === "object").map((c) => ({
-    name: c.name || "", cells: Array.isArray(c.cells) ? c.cells.filter(Number.isInteger) : [], positive: c.positive || "", negative: c.negative || "",
-  }));
   const normLinks = (arr) => (Array.isArray(arr) ? arr : []).filter((l) => l && typeof l === "object").map((l) => ({
     between: Array.isArray(l.between) ? l.between.filter(Number.isInteger) : [], positive: l.positive || "", negative: l.negative || "",
   }));
-  if (!node.k2) node.k2 = { characters: [], links: [] };
+  if (!node.k2) node.k2 = { structured_characters: true, characters: [], links: [] };
+  const structured = data.structured_characters !== undefined
+    ? data.structured_characters : node.k2.structured_characters !== false;
   if (data.characters !== undefined) {
-    node.k2.characters = normChars(data.characters);
-    if (!node.k2.characters.length) node.k2.characters = [blankChar()];
+    node.k2.characters = (Array.isArray(data.characters) ? data.characters : [])
+      .filter((c) => c && typeof c === "object").map((c) => normalizeCharacter(c, structured));
+    if (!node.k2.characters.length) node.k2.characters = [blankChar(structured)];
+  } else if (structured !== (node.k2.structured_characters !== false)) {
+    node.k2.characters = node.k2.characters.map((c) => normalizeCharacter(c, structured));
   }
+  node.k2.structured_characters = structured;
   const linksSrc = data.links !== undefined ? data.links : data.interactions;
   if (linksSrc !== undefined) node.k2.links = normLinks(linksSrc);
 
@@ -172,15 +222,15 @@ function render(node) {
   const button = (text, bg) =>
     el("button", { background: bg || "#3a3f4b", color: "#fff", border: "none", borderRadius: "5px", padding: "5px 9px", cursor: "pointer", fontSize: "12px" }, { textContent: text });
 
-  const textArea = (val, placeholder, onInput) => {
-    const t = el("textarea", { width: "100%", boxSizing: "border-box", background: "#1c1e24", color: "#e6e6e6", border: "1px solid #333", borderRadius: "5px", padding: "5px", fontSize: "12px", resize: "vertical", minHeight: "104px", marginTop: "3px" }, { value: val || "", placeholder: placeholder || "" });
+  const textArea = (val, placeholder, onInput, minHeight = 104) => {
+    const t = el("textarea", { width: "100%", boxSizing: "border-box", background: "#1c1e24", color: "#e6e6e6", border: "1px solid #333", borderRadius: "5px", padding: "5px", fontSize: "12px", resize: "vertical", minHeight: minHeight + "px", marginTop: "3px" }, { value: val || "", placeholder: placeholder || "" });
     t.addEventListener("input", () => onInput(t.value));
     // keep canvas keyboard shortcuts from stealing typing
     t.addEventListener("pointerdown", (e) => e.stopPropagation());
     return t;
   };
 
-  // ---- layout JSON (full scene: aspect + grid + characters + interactions) ----
+  // ---- layout JSON (full scene: aspect, grid, character mode, cards, links) ----
   // Kept in sync with the controls below (editing a card / grid rewrites this box);
   // paste a full layout here and click Apply to load it in one shot. The Apply
   // button is disabled while the box already matches the current layout.
@@ -226,6 +276,20 @@ function render(node) {
 
   // ---- characters ----
   root.appendChild(heading("Characters"));
+  const modeRow = el("label", { display: "flex", alignItems: "center", gap: "7px", margin: "3px 0 6px", color: "#d8dce3", fontSize: "12px", cursor: "pointer" });
+  modeRow.addEventListener("pointerdown", (e) => e.stopPropagation());
+  const modeCheckbox = el("input", null, { type: "checkbox", checked: node.k2.structured_characters !== false });
+  modeCheckbox.addEventListener("change", () => {
+    const structured = modeCheckbox.checked;
+    node.k2.characters = node.k2.characters.map((c) => normalizeCharacter(c, structured));
+    node.k2.structured_characters = structured;
+    save(node); render(node);
+  });
+  modeRow.appendChild(modeCheckbox);
+  modeRow.appendChild(el("span", null, { textContent: "Structured character prompts" }));
+  root.appendChild(modeRow);
+  root.appendChild(el("div", { color: "#8b8f98", fontSize: "10px", marginBottom: "6px" },
+    { textContent: "Legacy mode combines character fields into positive / negative. Turning structure back on puts that text in Generic." }));
   node.k2.characters.forEach((ch, ci) => {
     const color = PALETTE[ci % PALETTE.length];
     const card = el("div", { border: `1px solid #333`, borderLeft: `4px solid ${color}`, borderRadius: "6px", padding: "7px", marginBottom: "7px", background: "#23262e" });
@@ -244,7 +308,7 @@ function render(node) {
       for (const ln of node.k2.links) {
         ln.between = (ln.between || []).filter((b) => b !== ci + 1).map((b) => (b > ci + 1 ? b - 1 : b));
       }
-      if (!node.k2.characters.length) node.k2.characters = [blankChar()];
+      if (!node.k2.characters.length) node.k2.characters = [blankChar(node.k2.structured_characters !== false)];
       save(node); render(node);
     });
     head.appendChild(del);
@@ -273,13 +337,31 @@ function render(node) {
     card.appendChild(el("div", { fontSize: "10px", color: "#8b8f98", marginBottom: "2px" }, { textContent: "where on canvas (click cells; none = whole image)" }));
     card.appendChild(gridBox);
 
-    card.appendChild(textArea(ch.positive, "positive — looks + what they do", (v) => { ch.positive = v; save(node); }));
-    card.appendChild(textArea(ch.negative, "negative — what to avoid for this character", (v) => { ch.negative = v; save(node); }));
+    if (node.k2.structured_characters !== false) {
+      for (const [label, posKey, negKey] of [
+        ["Generic", "generic_positive", "generic_negative"],
+        ["Looks", "looks_positive", "looks_negative"],
+        ["Pose / action", "pose_action_positive", "pose_action_negative"],
+      ]) {
+        card.appendChild(el("div", { color: "#aeb6c2", fontSize: "11px", fontWeight: "600", marginTop: "6px" }, { textContent: label }));
+        const pair = el("div", { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))", gap: "6px" });
+        for (const [key, kind] of [[posKey, "positive"], [negKey, "negative"]]) {
+          const field = el("div");
+          field.appendChild(el("div", { color: "#8b8f98", fontSize: "10px", marginTop: "3px" }, { textContent: kind }));
+          field.appendChild(textArea(ch[key], label.toLowerCase() + " " + kind, (v) => { ch[key] = v; save(node); }, 68));
+          pair.appendChild(field);
+        }
+        card.appendChild(pair);
+      }
+    } else {
+      card.appendChild(textArea(ch.positive, "positive — looks + what they do", (v) => { ch.positive = v; save(node); }));
+      card.appendChild(textArea(ch.negative, "negative — what to avoid for this character", (v) => { ch.negative = v; save(node); }));
+    }
     root.appendChild(card);
   });
 
   const addChar = button("+ Add character");
-  addChar.addEventListener("click", () => { node.k2.characters.push(blankChar()); save(node); render(node); });
+  addChar.addEventListener("click", () => { node.k2.characters.push(blankChar(node.k2.structured_characters !== false)); save(node); render(node); });
   root.appendChild(addChar);
 
   // ---- interactions ----
@@ -360,8 +442,9 @@ function setup(node) {
       };
     }
   }
-  loadState(node);
+  const migrated = loadState(node);
   render(node);
+  if (migrated) save(node);
   hideRaw(node);     // hide the raw JSON widget only after a clean render, so a
                      // render failure leaves it visible as the editable fallback
   remeasure(node);
@@ -385,8 +468,9 @@ app.registerExtension({
       const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
       try {
         if (!this.k2_root) setup(this);
-        loadState(this);
+        const migrated = loadState(this);
         render(this);
+        if (migrated) save(this);
         remeasure(this);
       } catch (e) { console.error("[RegionalMultiChar] configure failed", e); }
       return r;
