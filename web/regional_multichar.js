@@ -568,6 +568,27 @@ const COMPOSE_SETTINGS = ["subject_count_lock", "use_names", "bind_interactions"
   "output_format", "auto_framing", "negative_mode", "global_positive", "global_negative",
   "prompt_profile", "negative_term_cap", "negative_cap_priority", "spatial_cues",
   "scale_cues", "layout_json_override"];
+const COMPOSE_JSON_SETTINGS = ["global_positive", "global_negative", "subject_count_lock",
+  "use_names", "bind_interactions", "cast_roster", "order_and_group", "auto_scale_hints",
+  "spatial_detail", "output_format", "auto_framing", "negative_mode", "prompt_profile",
+  "negative_term_cap", "negative_cap_priority", "spatial_cues", "scale_cues"];
+const COMPOSE_DEFAULTS = {
+  global_positive: "", global_negative: "", subject_count_lock: true, use_names: "handle",
+  bind_interactions: true, cast_roster: true, order_and_group: true, auto_scale_hints: true,
+  spatial_detail: "fine", output_format: "prose", auto_framing: false,
+  negative_mode: "global_dedup", prompt_profile: "default", negative_term_cap: 0,
+  negative_cap_priority: "global_first", spatial_cues: "auto", scale_cues: "off",
+};
+const COMPOSE_BOOLEAN_SETTINGS = new Set(["subject_count_lock", "bind_interactions",
+  "cast_roster", "order_and_group", "auto_scale_hints", "auto_framing"]);
+const COMPOSE_ENUM_SETTINGS = {
+  use_names: ["handle", "label", "off"], spatial_detail: ["fine", "coarse", "grid_coords"],
+  output_format: ["prose", "labeled", "numbered"],
+  negative_mode: ["global_dedup", "to_positive_assertion"],
+  prompt_profile: ["default", "flux2"],
+  negative_cap_priority: ["global_first", "interaction_first"],
+  spatial_cues: ["auto", "always", "off"], scale_cues: ["off", "row_based"],
+};
 
 // in-node options guide (rendered with mdToHtml). No apostrophes so it stays
 // safe inside single-quoted JS strings; double quotes + backticks are literal.
@@ -613,7 +634,7 @@ const HELP_MD = [
   "**negative_term_cap** — 0 keeps every negative term. Set a limit to keep only the first N terms in the selected priority order. Review dropped terms in the report.",
   "**negative_cap_priority** — `global_first` keeps global negatives first; `interaction_first` gives link guards the first slots in flux2 mode.",
   "**spatial_cues / scale_cues** — flux2 controls. Auto spatial cues skip a 1x1 or fully shared grid. Row-based scale cues are opt-in because vertical position may not mean depth.",
-  "**Layout JSON override** — paste a full layout and Apply to use it in this composer without changing the connected layout. Clear returns to the connected layout.",
+  "**Prompt settings JSON** — copy or paste this node's global prompts and settings in one object. The character grid and interaction JSON stay in Regional Characters.",
 ].join("\n");
 
 // build the exact payload the backend expects from a compose node
@@ -647,7 +668,7 @@ function composeGather(node) {
 
 async function composeRefresh(node) {
   if (!node.mc_preview) return;
-  composeSyncLayoutJSON(node);
+  composeSyncSettingsJSON(node);
   const requestId = (node._mcRefreshSeq || 0) + 1;
   node._mcRefreshSeq = requestId;
   try {
@@ -667,13 +688,21 @@ async function composeRefresh(node) {
   node.setDirtyCanvas(true, true);
 }
 
-function composeSyncLayoutJSON(node) {
-  const editor = node._composeLayoutEditor;
-  if (!editor || editor.dirty) return;
-  const override = String(widgetVal(node, "layout_json_override", "") || "");
-  editor.ta.value = override.trim() || JSON.stringify(composeGather(node).layout, null, 2);
-  editor.status.textContent = override.trim() ? "Local override active" : "Using connected layout";
-  editor.clear.disabled = !override.trim();
+function composeSettingsObject(node) {
+  const values = {};
+  for (const name of COMPOSE_JSON_SETTINGS) {
+    values[name] = widgetVal(node, name, COMPOSE_DEFAULTS[name]);
+  }
+  return values;
+}
+
+function composeSyncSettingsJSON(node) {
+  const editor = node._composeSettingsEditor;
+  if (!editor) return;
+  const legacy = String(widgetVal(node, "layout_json_override", "") || "").trim();
+  editor.legacyRow.style.display = legacy ? "flex" : "none";
+  if (editor.dirty) return;
+  editor.ta.value = JSON.stringify(composeSettingsObject(node), null, 2);
   editor.apply.disabled = true;
 }
 
@@ -707,7 +736,11 @@ function bigTextarea(self, widgetName, label, minH) {
     resize: "vertical", minHeight: minH + "px", lineHeight: "1.4",
   }, { value: (w && w.value) || "" });
   ta.addEventListener("pointerdown", (e) => e.stopPropagation());
-  ta.addEventListener("input", () => { if (w) w.value = ta.value; composeScheduleRefresh(self); });
+  ta.addEventListener("input", () => {
+    if (w) w.value = ta.value;
+    composeSyncSettingsJSON(self);
+    composeScheduleRefresh(self);
+  });
   wrap.appendChild(ta);
   if (w) {  // hide the original widget; this textarea now edits its value
     w.hidden = true;
@@ -774,66 +807,104 @@ app.registerExtension({
       const negTA = bigTextarea(self, "global_negative", "Global negative (avoid everywhere)", 90);
       this._taRefs = { global_positive: posTA, global_negative: negTA };
 
-      const layoutWrap = el("div", { marginTop: "8px" });
-      layoutWrap.appendChild(el("div", { fontSize: "10px", color: "#8b8f98", margin: "2px 0", textTransform: "uppercase", letterSpacing: ".04em" },
-        { textContent: "Layout JSON (edit / paste → Apply)" }));
-      const layoutTA = el("textarea", {
+      const settingsWrap = el("div", { marginTop: "8px" });
+      settingsWrap.appendChild(el("div", { fontSize: "10px", color: "#8b8f98", margin: "2px 0", textTransform: "uppercase", letterSpacing: ".04em" },
+        { textContent: "Prompt settings JSON (edit / paste → Apply)" }));
+      const settingsTA = el("textarea", {
         width: "100%", boxSizing: "border-box", background: "#161821", color: "#cfe3d6",
         border: "1px solid #333", borderRadius: "5px", padding: "6px", fontSize: "11px",
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", resize: "vertical",
-        minHeight: "120px", whiteSpace: "pre",
+        minHeight: "230px", whiteSpace: "pre",
       }, { spellcheck: false });
-      layoutTA.addEventListener("pointerdown", (e) => e.stopPropagation());
-      const layoutRow = el("div", { display: "flex", alignItems: "center", gap: "7px", margin: "4px 0" });
-      const applyLayout = mkBtn("Apply JSON layout");
-      const clearLayout = mkBtn("Clear override");
-      const copyLayout = mkBtn("Copy JSON");
-      const layoutStatus = el("span", { fontSize: "11px", color: "#9aa0aa", flex: "1" }, { textContent: "" });
-      const layoutError = el("div", { fontSize: "11px", color: "#c0616b" }, { textContent: "" });
-      this._composeLayoutEditor = { ta: layoutTA, status: layoutStatus, clear: clearLayout,
-        apply: applyLayout, dirty: false };
-      layoutTA.addEventListener("input", () => {
-        self._composeLayoutEditor.dirty = true;
-        applyLayout.disabled = false;
-        layoutError.textContent = "";
+      settingsTA.addEventListener("pointerdown", (e) => e.stopPropagation());
+      const settingsRow = el("div", { display: "flex", alignItems: "center", gap: "7px", margin: "4px 0" });
+      const applySettings = mkBtn("Apply settings JSON");
+      const copySettings = mkBtn("Copy JSON");
+      const settingsError = el("div", { fontSize: "11px", color: "#c0616b" }, { textContent: "" });
+      const legacyRow = el("div", { display: "none", alignItems: "center", gap: "7px", margin: "4px 0",
+        color: "#d7b67a", fontSize: "11px" });
+      legacyRow.appendChild(el("span", null, { textContent: "An older layout override is active for this composer." }));
+      const clearLegacy = mkBtn("Clear old override");
+      legacyRow.appendChild(clearLegacy);
+      this._composeSettingsEditor = { ta: settingsTA, apply: applySettings,
+        legacyRow, dirty: false };
+      settingsTA.addEventListener("input", () => {
+        self._composeSettingsEditor.dirty = true;
+        applySettings.disabled = false;
+        settingsError.textContent = "";
       });
-      applyLayout.addEventListener("click", () => {
+      applySettings.addEventListener("click", () => {
         let parsed;
-        try { parsed = JSON.parse(layoutTA.value); }
-        catch (e) { layoutError.textContent = "Invalid JSON: " + e.message; return; }
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
-            (parsed.characters !== undefined && !Array.isArray(parsed.characters)) ||
-            (parsed.links !== undefined && !Array.isArray(parsed.links)) ||
-            (parsed.interactions !== undefined && !Array.isArray(parsed.interactions))) {
-          layoutError.textContent = "Characters and links must be arrays when present.";
+        try { parsed = JSON.parse(settingsTA.value); }
+        catch (e) { settingsError.textContent = "Invalid JSON: " + e.message; return; }
+        const data = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed.widgets_values_named || parsed) : null;
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          settingsError.textContent = "Expected a settings object.";
           return;
         }
-        const w = getWidget(self, "layout_json_override");
-        if (w) w.value = layoutTA.value;
-        self._composeLayoutEditor.dirty = false;
-        layoutError.textContent = "";
+        const updates = [];
+        for (const [name, value] of Object.entries(data)) {
+          if (name === "layout_json_override" && value === "") {
+            if (!getWidget(self, name)) {
+              settingsError.textContent = "Widget unavailable: " + name;
+              return;
+            }
+            updates.push([name, value]);
+            continue;
+          }
+          if (!COMPOSE_JSON_SETTINGS.includes(name)) {
+            settingsError.textContent = "Unknown composer setting: " + name;
+            return;
+          }
+          if (COMPOSE_BOOLEAN_SETTINGS.has(name) && typeof value !== "boolean") {
+            settingsError.textContent = name + " must be true or false.";
+            return;
+          }
+          if (name === "negative_term_cap" && (!Number.isInteger(value) || value < 0 || value > 1000)) {
+            settingsError.textContent = "negative_term_cap must be an integer from 0 to 1000.";
+            return;
+          }
+          if (COMPOSE_ENUM_SETTINGS[name] && !COMPOSE_ENUM_SETTINGS[name].includes(value)) {
+            settingsError.textContent = name + " must be one of: " + COMPOSE_ENUM_SETTINGS[name].join(", ");
+            return;
+          }
+          if ((name === "global_positive" || name === "global_negative") && typeof value !== "string") {
+            settingsError.textContent = name + " must be a string.";
+            return;
+          }
+          const w = getWidget(self, name);
+          if (!w) {
+            settingsError.textContent = "Widget unavailable: " + name;
+            return;
+          }
+          updates.push([name, value]);
+        }
+        for (const [name, value] of updates) getWidget(self, name).value = value;
+        for (const name of ["global_positive", "global_negative"]) {
+          const ref = self._taRefs[name];
+          if (ref) ref.ta.value = widgetVal(self, name, "");
+        }
+        self._composeSettingsEditor.dirty = false;
+        settingsError.textContent = "";
         self.setDirtyCanvas(true, true);
         composeRefresh(self);
       });
-      clearLayout.addEventListener("click", () => {
+      clearLegacy.addEventListener("click", () => {
         const w = getWidget(self, "layout_json_override");
         if (w) w.value = "";
-        self._composeLayoutEditor.dirty = false;
-        layoutError.textContent = "";
         self.setDirtyCanvas(true, true);
         composeRefresh(self);
       });
-      copyLayout.addEventListener("click", async () => {
-        try { await navigator.clipboard.writeText(layoutTA.value); }
-        catch (e) { layoutTA.select(); document.execCommand("copy"); }
+      copySettings.addEventListener("click", async () => {
+        await copyPreviewText(settingsTA.value);
       });
-      layoutRow.appendChild(applyLayout);
-      layoutRow.appendChild(clearLayout);
-      layoutRow.appendChild(copyLayout);
-      layoutRow.appendChild(layoutStatus);
-      layoutWrap.appendChild(layoutTA);
-      layoutWrap.appendChild(layoutRow);
-      layoutWrap.appendChild(layoutError);
+      settingsRow.appendChild(applySettings);
+      settingsRow.appendChild(copySettings);
+      settingsWrap.appendChild(settingsTA);
+      settingsWrap.appendChild(settingsRow);
+      settingsWrap.appendChild(settingsError);
+      settingsWrap.appendChild(legacyRow);
       const overrideWidget = getWidget(this, "layout_json_override");
       if (overrideWidget) {
         overrideWidget.hidden = true;
@@ -857,7 +928,7 @@ app.registerExtension({
       root.appendChild(help);
       root.appendChild(posTA.wrap);
       root.appendChild(negTA.wrap);
-      root.appendChild(layoutWrap);
+      root.appendChild(settingsWrap);
       root.appendChild(div);
 
       this.mc_widget = this.addDOMWidget("mc_ui", "mc_ui", root, { hideOnZoom: false });
@@ -871,6 +942,7 @@ app.registerExtension({
         const prev = w.callback;
         w.callback = function () {
           const rr = prev ? prev.apply(this, arguments) : undefined;
+          composeSyncSettingsJSON(self);
           composeScheduleRefresh(self);
           return rr;
         };
@@ -879,7 +951,7 @@ app.registerExtension({
       if (window.ResizeObserver) {
         try { new ResizeObserver(() => self.setDirtyCanvas(true, true)).observe(root); } catch (e) { /* */ }
       }
-      composeSyncLayoutJSON(this);
+      composeSyncSettingsJSON(this);
       composeScheduleRefresh(this);
       return r;
     };
@@ -915,8 +987,9 @@ app.registerExtension({
           if (w.inputEl) w.inputEl.style.display = "none";
           if (w.element) w.element.style.display = "none";
         }
-        if (this._composeLayoutEditor) this._composeLayoutEditor.dirty = false;
+        if (this._composeSettingsEditor) this._composeSettingsEditor.dirty = false;
       } catch (e) { /* */ }
+      composeSyncSettingsJSON(this);
       composeScheduleRefresh(this);
       return r;
     };

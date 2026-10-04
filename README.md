@@ -141,7 +141,7 @@ Wording-based alternative to masked conditioning. Assembles **one** natural-lang
 | `negative_cap_priority` | `global_first` | `global_first` keeps global terms before character and interaction terms; `interaction_first` puts interaction guards first in `flux2` |
 | `spatial_cues` | `auto` | In `flux2`, `auto` skips grid wording for a 1x1 grid or when all characters share the same cells; `always` forces it; `off` removes it |
 | `scale_cues` | `off` | In `flux2`, `row_based` allows the existing top=far/bottom=near scale hint; `off` avoids assuming that vertical position means depth |
-| `layout_json_override` | empty | Optional JSON pasted into the composer. When set, it replaces the connected layout for this node only |
+| `layout_json_override` | empty | Legacy layout override retained for saved workflows; the composer hides this widget in new workflows |
 
 **Outputs:** `positive` (CONDITIONING), `negative` (CONDITIONING), `positive_text` (STRING), `negative_text` (STRING), `prompt_report` (STRING markdown).
 
@@ -151,7 +151,9 @@ Check the sampler before tuning negatives. ComfyUI [skips the unconditional pass
 
 In `flux2`, the composer also skips a count-lock sentence if the global positive already states the same headcount, removes exact comma-separated clauses repeated between a character and its interaction, and places each interaction after the last group containing one of its members. It keeps unique interaction details. The wording is cleaned up at sentence joins. A plain role name such as `Mature Woman` becomes `the mature woman` in prose handles, while labeled and numbered character lines keep the name as entered.
 
-The node has its own **Layout JSON (edit / paste -> Apply)** box. It starts with the connected layout so you can copy it. Paste a revised layout and click **Apply JSON layout** to use it without changing the upstream editor or the masked-conditioning branch. **Clear override** returns to the connected layout. You can paste a full layout or just the fields you want to change. `characters` and `links` must be arrays when present; `interactions` is accepted as an alias for `links`. The composer reads `grid_cols`, `grid_rows`, `characters`, and `links`; `aspect` and `batch_size` can remain in copied JSON but do not affect its text output.
+The composer has a **Prompt settings JSON (edit / paste -> Apply)** box. It shows this node's `global_positive`, `global_negative`, and all prompt assembly settings. Copy the JSON to edit it elsewhere, then paste it and click **Apply settings JSON**. A partial object updates only the keys it contains. You can also paste a `widgets_values_named` object from a workflow. The box stays in sync when you change a widget or either global prompt, unless you have an un-applied JSON edit in progress. Character positions and interactions belong in the **Layout JSON** box on `RegionalCharacterLayout`; the composer settings box does not include `grid_cols`, `grid_rows`, `characters`, `links`, `aspect`, or `batch_size`.
+
+Older workflows with a nonempty `layout_json_override` still use that override. The composer shows a notice and a **Clear old override** button when one is active. New settings JSON does not create a layout override.
 
 Saved workflows without these widgets still use the old defaults. Existing node names, port order, layout JSON structure, and masked conditioning are unchanged.
 
@@ -234,8 +236,7 @@ The visual editor in the node panel serializes everything into a single hidden w
 - **`between`** — 1-based character indices matching the card order in the editor.
 - A character with no cells (`[]`) receives a full-canvas mask (conditioned everywhere).
 
-A full-layout JSON (including `aspect`, `grid_cols`, `grid_rows`, `batch_size`) can be pasted into the "Layout JSON (edit / paste → Apply)" textarea in the editor to load the whole scene in one shot.
-The same JSON can be pasted into the composer override. In the composer, Apply changes only that composer; it does not update the grid editor or latent size.
+A full-layout JSON (including `aspect`, `grid_cols`, `grid_rows`, `batch_size`) can be pasted into the "Layout JSON (edit / paste -> Apply)" textarea in the `RegionalCharacterLayout` editor to load the whole scene in one shot. The composer JSON box accepts prompt settings instead of layout fields.
 
 ---
 
@@ -336,7 +337,7 @@ Registered via `WEB_DIRECTORY = "./web"` in `__init__.py`. Three ComfyUI extensi
 |---|---|---|
 | `Regional.MultiChar` | `RegionalCharacterLayout` | Injects the visual character/interaction/grid editor as a DOM widget |
 | `Regional.MultiCharPreview` | `MultiCharPromptPreview` | Shows exact positive and negative strings in separate copyable raw-text blocks, with optional Markdown rendering |
-| `Regional.MultiCharComposeLive` | `MultiCharPromptCompose` | Adds the live preview, larger textareas, and a layout JSON override box; POSTs to `/multichar/preview` with a 3-second debounce |
+| `Regional.MultiCharComposeLive` | `MultiCharPromptCompose` | Adds the live preview, larger textareas, and a prompt settings JSON box; POSTs to `/multichar/preview` with a 3-second debounce |
 
 The editor stores its state in `node.k2` (a `{characters, links}` object). Every interactive change calls `save(node)`, which serialises `node.k2` to the hidden `layout_json` widget, then calls `node.setDirtyCanvas()` to mark the graph dirty. The raw `layout_json` textarea is hidden after a successful first render; if JavaScript fails, it remains visible as a plain editable fallback so the node always works.
 

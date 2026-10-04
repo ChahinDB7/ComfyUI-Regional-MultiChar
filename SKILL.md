@@ -90,6 +90,7 @@ A "full layout JSON" — adding `aspect`, `grid_cols`, `grid_rows`, `batch_size`
 
 | Parameter | Effect |
 |---|---|
+| `global_positive` / `global_negative` | Scene-wide positive text and terms to avoid everywhere. Both appear in the composer's settings JSON. |
 | `subject_count_lock` | Adds "There are exactly N people and no one else" to prevent dropped or extra characters. |
 | `use_names` | `handle` = stable referent like "the blonde woman" (best coherence); `label` = "Woman: ..." prefix; `off` = no prefix. |
 | `bind_interactions` | Rewrites interaction text to name its characters: "The woman and the man are kissing..." (you type only "kissing..."). |
@@ -105,13 +106,13 @@ A "full layout JSON" — adding `aspect`, `grid_cols`, `grid_rows`, `batch_size`
 | `negative_cap_priority` | `global_first` keeps global, character, then interaction terms. `interaction_first` gives interaction guards priority when a cap is active in `flux2`. |
 | `spatial_cues` | In `flux2`: `auto` skips cues for a 1x1 grid or a fully shared cell selection; `always` forces them; `off` suppresses them. |
 | `scale_cues` | In `flux2`: `off` avoids treating grid row as depth; `row_based` restores the old top=far/bottom=near wording. |
-| `layout_json_override` | Optional full or partial JSON in the composer's **Layout JSON (edit / paste -> Apply)** box. Apply affects only this composer; Clear returns to the connected layout. |
+| `layout_json_override` | Legacy layout override retained for saved workflows. The composer hides it in new workflows and shows a Clear button if an old override is active. |
 
 **Outputs:** `positive` (CONDITIONING), `negative` (CONDITIONING), `positive_text` (STRING), `negative_text` (STRING), `prompt_report` (STRING, structured markdown of every decision made).
 
 **Live preview:** A preview panel inside the node POSTs the current layout and settings to `/multichar/preview` (a backend HTTP route provided by the pack) every 3 seconds after any edit, showing the assembled prompt without running the graph. The report lists duplicate clauses, profile adjustments, dropped negative terms, and rough length estimates. Its token estimate is only a character-based approximation.
 
-**Layout copy/paste:** The compose node's JSON box starts with the connected layout. Copy it to revise it elsewhere, then paste and Apply. `characters` and `links` are arrays when present; `interactions` is accepted as an alias for `links`. `aspect` and `batch_size` may be present in a copied full layout but do not change the compose node's text output or latent size. A local override does not change `RegionalCharacterLayout` or masked conditioning.
+**Prompt settings copy/paste:** The compose node's **Prompt settings JSON (edit / paste -> Apply)** box contains `global_positive`, `global_negative`, and all prompt assembly settings listed above. Copy it to revise the node elsewhere, then paste and click **Apply settings JSON**. A partial object changes only its listed keys. A workflow's `widgets_values_named` object can also be pasted; an empty legacy `layout_json_override` value is accepted to clear it. The box does not contain `grid_cols`, `grid_rows`, `characters`, `links`, `aspect`, or `batch_size`. Those belong in the **Layout JSON** box on `RegionalCharacterLayout`. Older saved composer layout overrides still work, and an active one is flagged with a **Clear old override** button.
 
 ---
 
