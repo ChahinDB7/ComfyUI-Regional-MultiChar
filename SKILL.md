@@ -167,7 +167,7 @@ Writes the numeric `seed` input on each decoded `IMAGE` in the batch. Put it aft
 
 `optimize=none` uses the chosen text and shadow colors. `optimize=grayscale` forces white text with a black outline for light and dark manga areas. `optimize=photo_realistic` uses white text on a translucent dark plate. The preset styles the text only; it does not convert the image to grayscale.
 
-For exact traceability, add ComfyUI's built-in `PrimitiveInt`, set its control after generate to `fixed`, and connect its single `INT` output to both `KSampler.seed` and `RegionalSeedLabel.seed`. Do not keep independent seed values in two widgets. KSampler does not output its actual seed. This post-processing node has no effect on sampling or prompt assembly, and saved graphs without it are unchanged.
+For exact traceability, connect one built-in `PrimitiveInt` output to both the sampler's `seed` input and `RegionalSeedLabel.seed`. Set the source's control after generate to `randomize` for a new seed each run, or `fixed` when reproducing a result. Both nodes receive the same seed. Do not keep independent seed values in two widgets. The sampler does not output its actual seed. This post-processing node has no effect on sampling or prompt assembly, and saved graphs without it are unchanged.
 
 ---
 
@@ -277,7 +277,7 @@ KSampler → base_latent ──────────────────�
                 ↓ final latent
 ```
 
-For monochrome manga output with a visible seed, append `RegionalGrayscaleFilter → RegionalSeedLabel → Save Image` after the final decoded or FaceDetailer image. Keep the filter enabled to remove stray color. Feed both the sampler and the label from one fixed `PrimitiveInt` seed source.
+For monochrome manga output with a visible seed, append `RegionalGrayscaleFilter → RegionalSeedLabel → Save Image` after the final decoded or FaceDetailer image. Keep the filter enabled to remove stray color. Feed both the sampler and the label from one `PrimitiveInt` seed source; use `randomize` after generate for varied seeds or `fixed` to reproduce a result.
 
 ---
 

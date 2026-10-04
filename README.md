@@ -235,7 +235,7 @@ This is a final image filter. It catches colored pixels left in a manga image wi
 
 Connect a decoded `IMAGE` to `image` and an `INT` to `seed`. The node writes `Seed: 42` (or your chosen prefix and seed) on every image in the batch, then returns an `IMAGE`. Put it after the grayscale filter if you use one. With `enabled=false`, it returns the input image unchanged.
 
-For an exact label, use ComfyUI's built-in `PrimitiveInt` as a shared seed source: connect its `INT` output to both `KSampler.seed` and `RegionalSeedLabel.seed`. Set the seed source's **control after generate** to `fixed`. KSampler has no seed output, so typing the same number into two separate widgets does not keep them synchronized if either one changes.
+For an exact label, use ComfyUI's built-in `PrimitiveInt` as a shared seed source: connect its `INT` output to both the sampler's `seed` input and `RegionalSeedLabel.seed`. Set the seed source's **control after generate** to `randomize` for a new seed each run, or `fixed` to repeat one. Both nodes receive the same seed from the shared source. Typing a number into two separate seed widgets does not keep them synchronized.
 
 | Tweak | Default | Effect |
 |---|---|---|
