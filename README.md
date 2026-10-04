@@ -19,6 +19,7 @@ Place characters on a grid, give each one their own prompt, link two for an inte
    - [Regional FaceDetailer Toggle](#6-regional-facedetailer-toggle)
    - [Regional Hires Toggle](#7-regional-hires-toggle)
    - [Grayscale Filter (optional)](#8-grayscale-filter-optional)
+   - [Seed Label (optional)](#9-seed-label-optional)
 4. [Technical Deep-Dive](#technical-deep-dive)
    - [Layout JSON Schema](#layout-json-schema)
    - [Mask Building Pipeline](#mask-building-pipeline)
@@ -52,7 +53,7 @@ Both approaches share the same visual grid editor.
    ```
    ComfyUI/custom_nodes/ComfyUI-Regional-MultiChar/
    ```
-2. Restart ComfyUI. Conditioning nodes appear under **Regional/conditioning**; the grayscale filter appears under **Regional/image**.
+2. Restart ComfyUI. Conditioning nodes appear under **Regional/conditioning**; the grayscale filter and seed label appear under **Regional/image**.
 
 No additional Python packages are required for the core nodes. The optional `MultiCharLayoutEnhancer` node also requires `transformers` (already present in most ComfyUI environments).
 
@@ -225,6 +226,29 @@ Connect the final decoded `IMAGE` to this node, then connect its output to Save 
 The tone controls run before the strength mix. For a lighter manga print, keep `grayscale_strength=1.0` and try `black_lift=0.05` to `0.15`. Increase `brightness` slightly if the whole image is too dark. The new tweaks are optional inputs; saved workflows without them use the defaults and produce the same grayscale as before.
 
 This is a final image filter. It catches colored pixels left in a manga image without changing the prompt, sampler, or other nodes. It cannot repair line art or anatomy.
+
+---
+
+### 9. Seed Label (optional)
+
+**Internal name:** `RegionalSeedLabel`
+
+Connect a decoded `IMAGE` to `image` and an `INT` to `seed`. The node writes `Seed: 42` (or your chosen prefix and seed) on every image in the batch, then returns an `IMAGE`. Put it after the grayscale filter if you use one. With `enabled=false`, it returns the input image unchanged.
+
+For an exact label, use ComfyUI's built-in `PrimitiveInt` as a shared seed source: connect its `INT` output to both `KSampler.seed` and `RegionalSeedLabel.seed`. Set the seed source's **control after generate** to `fixed`. KSampler has no seed output, so typing the same number into two separate widgets does not keep them synchronized if either one changes.
+
+| Tweak | Default | Effect |
+|---|---|---|
+| `position` | `bottom_right` | Choose a corner, or `custom` for percentage coordinates. |
+| `optimize` | `none` | `none` uses your text and shadow colors; `grayscale` uses white text with a black outline; `photo_realistic` uses white text on a dark translucent plate. |
+| `font` / `font_file` | `sans` / empty | Choose sans, mono, serif, or the Pillow default. A local `.ttf` or `.otf` path takes priority. |
+| `font_size` / `margin` | `28` / `24` | Text size and distance from the edge, in pixels. The node shrinks text if it would exceed the image. |
+| `text_color` | `#FFFFFF` | RGB hex or a Pillow color name. Used by `optimize=none`. |
+| `shadow` / `shadow_color` / `shadow_offset` | on / `#000000` / `2` | Draw a second copy behind the label. Grayscale mode forces its shadow to black. |
+| `prefix` | `Seed: ` | Text before the numeric seed. Use an empty prefix for digits only. |
+| `x_percent` / `y_percent` | `50` / `50` | Used only at `position=custom`; `0` is left or top and `100` is right or bottom. |
+
+The label is drawn after sampling and decoding. `optimize=grayscale` changes the label styling, not the image colors. Existing workflows without this node run as before. Pillow and NumPy are provided by a standard ComfyUI install.
 
 ---
 
@@ -401,7 +425,7 @@ RegionalCharacterLayout  →  layout
                              VAEDecode → image
 ```
 
-For a black-and-white manga result, connect `VAEDecode → Grayscale Filter → Save Image`. If you use FaceDetailer, put the filter after its final image output so that pass cannot reintroduce color.
+For a black-and-white manga result with a traceable seed, connect `VAEDecode → Grayscale Filter → Seed Label → Save Image`. Feed the same `PrimitiveInt` output to KSampler and Seed Label. If you use FaceDetailer, put the filter and label after its final image output.
 
 ### With optional LLM enrichment
 

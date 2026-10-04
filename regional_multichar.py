@@ -517,6 +517,154 @@ class RegionalGrayscaleFilter:
         return (rgb,)
 
 
+def _seed_label_font(family, size, font_file):
+    from PIL import ImageFont
+
+    candidates = {
+        "sans": ("DejaVuSans.ttf", "Arial.ttf"),
+        "mono": ("DejaVuSansMono.ttf", "Courier New.ttf"),
+        "serif": ("DejaVuSerif.ttf", "Times New Roman.ttf"),
+    }.get(family, ())
+    for candidate in ([font_file.strip()] if font_file and font_file.strip() else []) + list(candidates):
+        try:
+            return ImageFont.truetype(candidate, size)
+        except (OSError, ValueError):
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _render_seed_label(frame, seed, position, optimize, font, font_file,
+                       font_size, text_color, shadow, shadow_color, shadow_offset,
+                       margin, prefix, x_percent, y_percent):
+    from PIL import Image, ImageColor, ImageDraw
+
+    width, height = frame.size
+    label = str(prefix) + str(seed)
+    if not label:
+        return frame
+
+    if optimize == "grayscale":
+        foreground = (255, 255, 255)
+        shadow_rgb = (0, 0, 0)
+        stroke_fill = (0, 0, 0, 255)
+        plate = False
+    elif optimize == "photo_realistic":
+        foreground = (255, 255, 255)
+        shadow_rgb = ImageColor.getrgb(shadow_color)[:3]
+        stroke_fill = None
+        plate = True
+    else:
+        foreground = ImageColor.getrgb(text_color)[:3]
+        shadow_rgb = ImageColor.getrgb(shadow_color)[:3]
+        stroke_fill = None
+        plate = False
+
+    size = max(1, int(font_size))
+    inset = max(0, int(margin))
+    offset = max(0, int(shadow_offset)) if shadow else 0
+    while True:
+        face = _seed_label_font(font, size, font_file)
+        stroke = max(1, size // 12) if stroke_fill else 0
+        plate_pad = max(4, size // 5) if plate else 0
+        bounds = ImageDraw.Draw(frame).textbbox((0, 0), label, font=face, stroke_width=stroke)
+        text_width = bounds[2] - bounds[0]
+        text_height = bounds[3] - bounds[1]
+        if size <= 1 or (text_width + 2 * (inset + plate_pad + offset) <= width and
+                         text_height + 2 * (inset + plate_pad + offset) <= height):
+            break
+        size -= 1
+
+    outer = plate_pad + offset
+    if position == "custom":
+        left = round((width - text_width) * max(0, min(100, x_percent)) / 100)
+        top = round((height - text_height) * max(0, min(100, y_percent)) / 100)
+    else:
+        left = width - inset - outer - text_width if position.endswith("right") else inset + outer
+        top = height - inset - outer - text_height if position.startswith("bottom") else inset + outer
+    left = max(outer, min(left, width - text_width - outer))
+    top = max(outer, min(top, height - text_height - outer))
+    x, y = left - bounds[0], top - bounds[1]
+
+    overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    if plate:
+        pad = plate_pad
+        draw.rounded_rectangle((left - pad, top - pad, left + text_width + pad,
+                                top + text_height + pad), radius=pad,
+                               fill=(0, 0, 0, 170))
+    if shadow and offset:
+        draw.text((x + offset, y + offset), label, font=face,
+                  fill=(*shadow_rgb, 230), stroke_width=stroke,
+                  stroke_fill=stroke_fill)
+    draw.text((x, y), label, font=face, fill=(*foreground, 255),
+              stroke_width=stroke, stroke_fill=stroke_fill)
+    rendered = Image.alpha_composite(frame.convert("RGBA"), overlay)
+    return rendered if frame.mode == "RGBA" else rendered.convert("RGB")
+
+
+class RegionalSeedLabel:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
+                         "tooltip": "Connect the same INT source used by the sampler seed."}),
+                "enabled": ("BOOLEAN", {"default": True}),
+                "position": (["bottom_right", "bottom_left", "top_right", "top_left", "custom"],
+                             {"default": "bottom_right"}),
+                "optimize": (["none", "grayscale", "photo_realistic"], {"default": "none"}),
+            },
+            "optional": {
+                "font": (["sans", "mono", "serif", "default"], {"default": "sans"}),
+                "font_file": ("STRING", {"default": "", "tooltip": "Optional local .ttf or .otf path."}),
+                "font_size": ("INT", {"default": 28, "min": 1, "max": 512}),
+                "text_color": ("STRING", {"default": "#FFFFFF"}),
+                "shadow": ("BOOLEAN", {"default": True}),
+                "shadow_color": ("STRING", {"default": "#000000"}),
+                "shadow_offset": ("INT", {"default": 2, "min": 0, "max": 100}),
+                "margin": ("INT", {"default": 24, "min": 0, "max": 1024}),
+                "prefix": ("STRING", {"default": "Seed: "}),
+                "x_percent": ("INT", {"default": 50, "min": 0, "max": 100}),
+                "y_percent": ("INT", {"default": 50, "min": 0, "max": 100}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "apply"
+    CATEGORY = "Regional/image"
+    DESCRIPTION = "Print the connected sampler seed on decoded images."
+
+    def apply(self, image, seed, enabled=True, position="bottom_right", optimize="none",
+              font="sans", font_file="", font_size=28, text_color="#FFFFFF",
+              shadow=True, shadow_color="#000000", shadow_offset=2, margin=24,
+              prefix="Seed: ", x_percent=50, y_percent=50):
+        if not enabled:
+            return (image,)
+        if image.ndim != 4 or image.shape[-1] not in (3, 4):
+            raise ValueError("Seed Label expects an IMAGE batch with RGB or RGBA channels")
+        if image.shape[0] == 0:
+            return (image,)
+        import numpy as np
+        from PIL import Image
+
+        result = []
+        for frame in image:
+            pixels = (frame.detach().clamp(0, 1) * 255).round().byte().cpu().numpy()
+            pil_frame = Image.fromarray(pixels)
+            rendered = _render_seed_label(
+                pil_frame, seed, position, optimize, font, font_file, font_size,
+                text_color, shadow, shadow_color, shadow_offset, margin, prefix,
+                x_percent, y_percent)
+            result.append(torch.from_numpy(np.asarray(rendered).copy()).to(
+                device=image.device, dtype=image.dtype) / 255.0)
+        return (torch.stack(result, dim=0),)
+
+
 # ---------------------------------------------------------------------------
 # Wording-based multi-character composer (no masks) + a read-only prompt viewer.
 # The composer mirrors the RegionalCharacterLayout editor fields in plain text
@@ -1445,6 +1593,7 @@ NODE_CLASS_MAPPINGS = {
     "RegionalFaceDetailerSwitch": RegionalFaceDetailerSwitch,
     "RegionalHiresSwitch": RegionalHiresSwitch,
     "RegionalGrayscaleFilter": RegionalGrayscaleFilter,
+    "RegionalSeedLabel": RegionalSeedLabel,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RegionalCharacterLayout": "Regional Characters (grid layout)",
@@ -1455,6 +1604,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RegionalFaceDetailerSwitch": "Regional FaceDetailer Toggle",
     "RegionalHiresSwitch": "Regional Hires Toggle",
     "RegionalGrayscaleFilter": "Grayscale Filter (optional)",
+    "RegionalSeedLabel": "Seed Label (optional)",
 }
 
 

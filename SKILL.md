@@ -161,6 +161,16 @@ Optional controls appear below `enabled`: `grayscale_strength` (`0` to `1`, defa
 
 ---
 
+### 9. `RegionalSeedLabel` ("Seed Label (optional)")
+
+Writes the numeric `seed` input on each decoded `IMAGE` in the batch. Put it after `RegionalGrayscaleFilter` and any image enhancement pass, before Save Image. `enabled=false` passes the image through unchanged. The default label is `Seed: <number>` at the bottom right, in white with a black shadow. `position` supports each corner and `custom`; the latter uses `x_percent` and `y_percent`. `font` offers sans, mono, serif, and Pillow default; `font_file` accepts a local `.ttf` or `.otf` path. `font_size`, `margin`, `text_color`, `shadow`, `shadow_color`, `shadow_offset`, and `prefix` are adjustable.
+
+`optimize=none` uses the chosen text and shadow colors. `optimize=grayscale` forces white text with a black outline for light and dark manga areas. `optimize=photo_realistic` uses white text on a translucent dark plate. The preset styles the text only; it does not convert the image to grayscale.
+
+For exact traceability, add ComfyUI's built-in `PrimitiveInt`, set its control after generate to `fixed`, and connect its single `INT` output to both `KSampler.seed` and `RegionalSeedLabel.seed`. Do not keep independent seed values in two widgets. KSampler does not output its actual seed. This post-processing node has no effect on sampling or prompt assembly, and saved graphs without it are unchanged.
+
+---
+
 ## Core Technical Concepts
 
 ### How Masks Are Built
@@ -267,7 +277,7 @@ KSampler → base_latent ──────────────────�
                 ↓ final latent
 ```
 
-For monochrome manga output, append `RegionalGrayscaleFilter → Save Image` after the final decoded or FaceDetailer image. Keep `enabled=true` to remove stray color, or set it to `false` to inspect the original image.
+For monochrome manga output with a visible seed, append `RegionalGrayscaleFilter → RegionalSeedLabel → Save Image` after the final decoded or FaceDetailer image. Keep the filter enabled to remove stray color. Feed both the sampler and the label from one fixed `PrimitiveInt` seed source.
 
 ---
 
