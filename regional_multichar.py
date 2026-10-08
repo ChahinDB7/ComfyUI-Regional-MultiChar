@@ -1584,6 +1584,201 @@ class MultiCharLayoutEnhancer:
         return (lay, "\n".join(rep) if rep else "layout enhancer: nothing to enrich")
 
 
+# ---------------------------------------------------------------------------
+# Video prompt nodes. A video model like MiniMax H3 takes ONE prompt: a style /
+# scene paragraph, a "Timeline:" of timed shots and an "Audio:" line. It encodes
+# that text inside its own conditioning node, so these nodes only build the
+# STRING (no CLIP input, nothing is encoded). They reuse assemble_multichar for
+# the cast block; everything above this section is untouched.
+# ---------------------------------------------------------------------------
+
+VIDEO_FPS = 24
+
+
+def video_frame_count(seconds, fps=VIDEO_FPS):
+    """Frames for `seconds`, rounded up to the 17k+5 grid MiniMax H3 uses
+    (5, 22, 39, ...). Same rule as align_frame_count in ComfyUI's nodes_minimax_h3."""
+    n = max(5, int(round(float(seconds) * fps)))
+    while n % 17 != 5:
+        n += 1
+    return n
+
+
+def _fmt_time(value, places):
+    text = ("%.*f" % (places, value)).rstrip("0").rstrip(".")
+    return (text or "0") + "s"
+
+
+def build_video_timeline(shots, seconds, weights="", fps=VIDEO_FPS):
+    """One shot per line -> "[0s-1.7s] shot" lines. Returns (text, frames, duration)."""
+    frames = video_frame_count(seconds, fps)
+    duration = frames / float(fps)
+    lines = [ln.strip() for ln in (shots or "").splitlines() if ln.strip()]
+    if not lines:
+        return "", frames, duration
+    if (weights or "").strip():
+        try:
+            w = [float(x) for x in weights.split(",") if x.strip()]
+        except ValueError:
+            raise ValueError("weights must be numbers separated by commas, got %r" % weights)
+        if len(w) != len(lines) or any(x <= 0 for x in w):
+            raise ValueError("weights needs %d positive numbers (one per shot), got %r"
+                             % (len(lines), weights))
+    else:
+        w = [1.0] * len(lines)
+    edges = [0.0]
+    for x in w:
+        edges.append(edges[-1] + duration * x / sum(w))
+    edges[-1] = duration
+    # one decimal reads better; go to two only if rounding would make an empty shot
+    for places in (1, 2):
+        marks = [_fmt_time(e, places) for e in edges]
+        if len(set(marks)) == len(marks):
+            break
+    text = "\n".join("[%s-%s] %s" % (marks[i], marks[i + 1], line)
+                     for i, line in enumerate(lines))
+    return text, frames, duration
+
+
+class MultiCharVideoTimeline:
+    """Turn one-shot-per-line text into a timed "[0s-1.7s] ..." block, plus the
+    frame count for the same length, so the timestamps and `length` always agree."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "seconds": ("FLOAT", {"default": 5.0, "min": 0.25, "max": 60.0, "step": 0.1,
+                    "tooltip": "Clip length. Rounded up to MiniMax H3's frame grid (5 s -> 124 frames = 5.2 s). Trained range is about 5-15 s."}),
+                "shots": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "One shot per line, no timestamps. The [start-end] ranges are added for you."}),
+            },
+            "optional": {
+                "weights": ("STRING", {"default": "",
+                    "tooltip": "Relative shot lengths, comma separated, one number per shot (e.g. 1,2,1). Empty = equal lengths."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "FLOAT")
+    RETURN_NAMES = ("timeline", "length", "duration")
+    FUNCTION = "build"
+    CATEGORY = "Regional/video"
+    DESCRIPTION = (
+        "Shots (one per line) -> timed Timeline text for a video prompt, plus the "
+        "matching frame count (connect `length` to the video node) and the real "
+        "duration in seconds after rounding to the model's frame grid."
+    )
+
+    def build(self, seconds, shots, weights=""):
+        return build_video_timeline(shots, seconds, weights)
+
+
+class MultiCharVideoPromptCompose:
+    """Text-only multi-character prompt for video models (MiniMax H3 style).
+
+    Same breakdown editor as Multi-Char Prompt Compose (layout in, cast block out),
+    then adds the Timeline / Audio sections. Outputs plain text, no CONDITIONING:
+    feed `prompt` into the video model's own prompt input. These models have no
+    negative prompt, so `negative_handling` decides what happens to negatives.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "global_positive": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Style + setting for the whole clip (look, lighting, location). Goes first."}),
+                "timeline": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Timed shots, e.g. from Multi-Char Video Timeline. A leading 'Timeline:' is added if missing."}),
+                "audio": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Sound, music and dialogue. 'Audio:' is added if missing."}),
+                "subject_count_lock": ("BOOLEAN", {"default": True, "label_on": "state the count", "label_off": "no count",
+                    "tooltip": "Adds 'There are exactly N people in the scene and no one else.'"}),
+                "use_names": (["handle", "label", "off"], {"default": "handle",
+                    "tooltip": "How characters are named in the cast block. Same options as Multi-Char Prompt Compose."}),
+                "bind_interactions": ("BOOLEAN", {"default": True, "label_on": "bind to characters", "label_off": "verbatim",
+                    "tooltip": "Rewrites an interaction to name its characters, from the 'between' chips."}),
+                "cast_roster": ("BOOLEAN", {"default": True, "label_on": "list the cast", "label_off": "no roster",
+                    "tooltip": "Adds a 'Cast: ...' line before the detailed sentences."}),
+                "order_and_group": ("BOOLEAN", {"default": True, "label_on": "order + group", "label_off": "card order",
+                    "tooltip": "Sorts characters left to right and merges same-cell characters into one clause."}),
+                "spatial_detail": (["fine", "coarse", "grid_coords"], {"default": "fine",
+                    "tooltip": "Grid cell -> position words. Same options as Multi-Char Prompt Compose."}),
+                "negative_handling": (["to_positive_assertion", "drop", "avoid_sentence"], {"default": "to_positive_assertion",
+                    "tooltip": "H3 is sampled without a negative prompt. to_positive_assertion: per-character negatives become positive traits ('old' -> 'young'), the rest is dropped. drop: ignore all negatives. avoid_sentence: append 'Avoid: ...' (experimental, a text encoder can read it as content)."}),
+            },
+            "optional": {
+                "layout": ("REGIONAL_LAYOUT",),
+                "global_negative": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Things to avoid everywhere. Handled by negative_handling."}),
+                "rules": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Optional paragraph between Timeline and Audio, e.g. 'Hard cuts only, no dissolves.'"}),
+                "end_notes": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "Optional last paragraph, e.g. constraints like 'no subtitles, no on-screen text'."}),
+                "prompt_profile": (["flux2", "default"], {"default": "flux2",
+                    "tooltip": "flux2 trims redundant cues and puts interactions next to their characters (suits LLM-based encoders). default keeps the plain assembly."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("prompt", "negative_text", "prompt_report")
+    FUNCTION = "build"
+    CATEGORY = "Regional/video"
+    DESCRIPTION = (
+        "Multi-character breakdown by wording for VIDEO models: cast block from the "
+        "layout, then Timeline and Audio. Text only (no CLIP). Wire `prompt` to the "
+        "video model's prompt input and `prompt_report` to Multi-Char Prompt Preview."
+    )
+
+    def build(self, global_positive, timeline, audio, subject_count_lock, use_names,
+              bind_interactions, cast_roster, order_and_group, spatial_detail,
+              negative_handling, layout=None, global_negative="", rules="",
+              end_notes="", prompt_profile="flux2"):
+        layout = _compose_layout(layout, "")
+        cols = int(layout.get("grid_cols", 3) or 3) if layout else 3
+        rows = int(layout.get("grid_rows", 1) or 1) if layout else 1
+        r = assemble_multichar(
+            cols, rows, (layout.get("characters") if layout else []) or [],
+            (layout.get("links") if layout else []) or [], {
+                "global_positive": global_positive, "global_negative": global_negative,
+                "subject_count_lock": subject_count_lock, "use_names": use_names,
+                "bind_interactions": bind_interactions, "cast_roster": cast_roster,
+                "order_and_group": order_and_group, "auto_scale_hints": False,
+                "spatial_detail": spatial_detail, "output_format": "prose",
+                "auto_framing": False,
+                "negative_mode": ("to_positive_assertion"
+                                  if negative_handling == "to_positive_assertion"
+                                  else "global_dedup")},
+            prompt_profile=prompt_profile)
+
+        parts = [r["positive"]]
+        timeline = (timeline or "").strip()
+        if timeline:
+            parts.append(timeline if timeline.lower().startswith("timeline:")
+                         else "Timeline:\n" + timeline)
+        if (rules or "").strip():
+            parts.append(rules.strip())
+        audio = (audio or "").strip()
+        if audio:
+            parts.append(audio if audio.lower().startswith("audio:") else "Audio: " + audio)
+        if (end_notes or "").strip():
+            parts.append(end_notes.strip())
+        used_negative = ""
+        if negative_handling == "avoid_sentence" and r["negative"]:
+            used_negative = r["negative"]
+            parts.append("Avoid: " + used_negative + ".")
+        prompt = "\n\n".join(p for p in parts if p)
+
+        # same layout as the compose report, so Multi-Char Prompt Preview can parse it
+        notes = ["## Video prompt", "- negative handling: **%s**" % negative_handling]
+        if r["negative"] and not used_negative:
+            notes.append("- not used (no negative prompt on this model): " + r["negative"])
+        report = (r["report"].split("## FINAL POSITIVE", 1)[0] + "\n".join(notes) + "\n\n"
+                  + "## FINAL POSITIVE\n```\n" + prompt + "\n```\n\n"
+                  + "## FINAL NEGATIVE\n```\n" + used_negative + "\n```")
+        return (prompt, used_negative, report)
+
+
 NODE_CLASS_MAPPINGS = {
     "RegionalCharacterLayout": RegionalCharacterLayout,
     "RegionalMultiCharConditioning": RegionalMultiCharConditioning,
@@ -1594,6 +1789,8 @@ NODE_CLASS_MAPPINGS = {
     "RegionalHiresSwitch": RegionalHiresSwitch,
     "RegionalGrayscaleFilter": RegionalGrayscaleFilter,
     "RegionalSeedLabel": RegionalSeedLabel,
+    "MultiCharVideoTimeline": MultiCharVideoTimeline,
+    "MultiCharVideoPromptCompose": MultiCharVideoPromptCompose,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RegionalCharacterLayout": "Regional Characters (grid layout)",
@@ -1605,6 +1802,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RegionalHiresSwitch": "Regional Hires Toggle",
     "RegionalGrayscaleFilter": "Grayscale Filter (optional)",
     "RegionalSeedLabel": "Seed Label (optional)",
+    "MultiCharVideoTimeline": "Multi-Char Video Timeline (shots -> timed)",
+    "MultiCharVideoPromptCompose": "Multi-Char Video Prompt Compose (text only)",
 }
 
 

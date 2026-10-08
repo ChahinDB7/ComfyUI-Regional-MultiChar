@@ -21,7 +21,7 @@ Both approaches share the same visual grid editor on the `RegionalCharacterLayou
 
 ---
 
-## The Eight Nodes
+## The Eleven Nodes
 
 ### 1. `RegionalCharacterLayout` ("Regional Characters (grid layout)")
 
@@ -171,6 +171,20 @@ For exact traceability, connect one built-in `PrimitiveInt` output to both the s
 
 ---
 
+### 10. `MultiCharVideoTimeline` ("Multi-Char Video Timeline (shots -> timed)")
+
+Video helper. Inputs: `seconds` (FLOAT), `shots` (one shot per line, no timestamps), optional `weights` (`1,2,1`, one positive number per shot, else it raises). Outputs `timeline` (`[0s-1.7s] shot` lines), `length` (INT frames at 24 fps, rounded up to MiniMax H3's 17k+5 grid) and `duration` (FLOAT, the real seconds after rounding). Wire `length` into the video node so timestamps and clip length stay in sync. Pure text work, no model.
+
+---
+
+### 11. `MultiCharVideoPromptCompose` ("Multi-Char Video Prompt Compose (text only)")
+
+Text-only twin of node 3 for video models. No `clip` input, no CONDITIONING output: the video model encodes the prompt itself, so wire `prompt` (STRING) into its prompt input. Builds the cast block with `assemble_multichar`, then `Timeline:` (from `timeline`), optional `rules`, `Audio:` and optional `end_notes`, joined by blank lines; a `Timeline:` or `Audio:` header you typed is not doubled. Outputs `prompt`, `negative_text`, `prompt_report` (same format as node 3's report, so Multi-Char Prompt Preview can show it).
+
+Video models have no negative prompt, so `negative_handling` is `to_positive_assertion` (default: per-character negatives become positive traits, the rest is dropped), `drop`, or `avoid_sentence` (appends `Avoid: ...`, experimental). `prompt_profile` defaults to `flux2`. Scale hints and auto framing are fixed off. Nodes 1-9 are unchanged by this addition.
+
+---
+
 ## Core Technical Concepts
 
 ### How Masks Are Built
@@ -257,6 +271,14 @@ RegionalCharacterLayout → layout
 MultiCharLayoutEnhancer → enriched layout
          ↓
 MultiCharPromptCompose
+```
+
+### Pattern 3b: Video (MiniMax H3), text only
+
+```
+RegionalCharacterLayout → layout ─┐
+MultiCharVideoTimeline ─ timeline ┼→ MultiCharVideoPromptCompose ─ prompt → MiniMaxH3ImageToVideo.prompt
+                         length ──────────────────────────────────────────→ MiniMaxH3ImageToVideo.length
 ```
 
 ### Pattern 4: FaceDetailer and hires as optional passes

@@ -20,6 +20,8 @@ Place characters on a grid, give each one their own prompt, link two for an inte
    - [Regional Hires Toggle](#7-regional-hires-toggle)
    - [Grayscale Filter (optional)](#8-grayscale-filter-optional)
    - [Seed Label (optional)](#9-seed-label-optional)
+   - [Multi-Char Video Timeline](#10-multi-char-video-timeline-shots---timed)
+   - [Multi-Char Video Prompt Compose (text only)](#11-multi-char-video-prompt-compose-text-only)
 4. [Technical Deep-Dive](#technical-deep-dive)
    - [Layout JSON Schema](#layout-json-schema)
    - [Mask Building Pipeline](#mask-building-pipeline)
@@ -250,6 +252,40 @@ For an exact label, use ComfyUI's built-in `PrimitiveInt` as a shared seed sourc
 
 The label is drawn after sampling and decoding. `optimize=grayscale` changes the label styling, not the image colors. Existing workflows without this node run as before. Pillow and NumPy are provided by a standard ComfyUI install.
 
+### 10. Multi-Char Video Timeline (shots -> timed)
+
+**Internal name:** `MultiCharVideoTimeline` - category `Regional/video`
+
+Type one shot per line in `shots` and set `seconds`. The node adds the `[start-end]` ranges and returns three things: `timeline` (the text), `length` (frame count at 24 fps, rounded up to MiniMax H3's 17k+5 grid: 5, 22, 39, ... 124 is about 5.2 s) and `duration` (the real length after rounding). Wire `length` to the video node so the timestamps and the clip length can't drift apart.
+
+| Tweak | Default | Effect |
+|---|---|---|
+| `seconds` | `5.0` | Clip length. MiniMax H3 is trained on roughly 5-15 s. |
+| `shots` | empty | One shot per line. Blank lines are skipped. Don't type timestamps. |
+| `weights` | empty | Relative shot lengths, e.g. `1,2,1`. Needs exactly one positive number per shot or the node raises an error. Empty means equal lengths. |
+
+Ranges use one decimal (`[1.7s-3.4s]`); if that would make an empty range with many short shots, it switches to two.
+
+### 11. Multi-Char Video Prompt Compose (text only)
+
+**Internal name:** `MultiCharVideoPromptCompose` - category `Regional/video`
+
+Same breakdown editor as node 3, for video models. It takes the layout and builds the cast block with the same assembler as Multi-Char Prompt Compose, then adds a `Timeline:` section, optional `rules`, an `Audio:` line and optional `end_notes`. It has **no CLIP input and outputs no CONDITIONING**: video models such as MiniMax H3 encode the prompt inside their own conditioning node, so you wire the `prompt` STRING into that node's prompt input. (Node 3 would waste a full encode with the video model's big text encoder and throw the result away.)
+
+Output order: style/scene + cast block, blank line, `Timeline:`, `rules`, `Audio:`, `end_notes`. A leading `Timeline:` or `Audio:` you type yourself isn't doubled.
+
+Outputs: `prompt`, `negative_text`, `prompt_report`. Wire `prompt_report` to the `text` input of Multi-Char Prompt Preview (and `prompt` to its `positive_text`) to read the final text.
+
+These models are sampled without a negative prompt, so `negative_handling` decides what to do with negatives:
+
+| Value | Effect |
+|---|---|
+| `to_positive_assertion` (default) | Per-character negatives turn into positive traits on that character (`old` -> `young`). Anything it can't convert is dropped and listed in the report. |
+| `drop` | Ignore every negative. |
+| `avoid_sentence` | Append `Avoid: ...` to the prompt. Experimental, a text encoder can read it as content. |
+
+`prompt_profile` defaults to `flux2` here (trims repeated cues, puts interactions next to their characters), which suits LLM-based encoders. Scale hints and auto framing are off; the shots describe the camera. Nothing in nodes 1-9 changed, and saved graphs that don't use these two nodes behave as before.
+
 ---
 
 ## Technical Deep-Dive
@@ -436,6 +472,16 @@ RegionalCharacterLayout → layout
                              ↓ enriched layout
                   MultiCharPromptCompose
 ```
+
+### Video (MiniMax H3), text only
+
+```
+RegionalCharacterLayout → layout ─┐
+MultiCharVideoTimeline ─ timeline ┼→ MultiCharVideoPromptCompose ─ prompt → MiniMaxH3ImageToVideo.prompt
+                         length ──────────────────────────────────────────→ MiniMaxH3ImageToVideo.length
+```
+
+Ready-made graphs (cafe scene, text-to-video and image-to-video) are in the setup repo under `assets/lightning/workflows/minimax/`.
 
 ### Hires + FaceDetailer
 
